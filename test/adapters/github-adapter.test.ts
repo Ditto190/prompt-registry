@@ -974,4 +974,53 @@ tags:
       assert.ok(bundles.some((b) => b.version === '0.8.0'), 'Should include v0.8.0');
     });
   });
+
+  suite('Readme Download', () => {
+    test('Readme content should be downloaded correctly', async () => {
+      nock('https://api.github.com')
+        .get('/repos/test-owner/test-repo/releases')
+        .reply(200, [
+          {
+            tag_name: 'v1.0.0',
+            name: 'Release 1.0.0',
+            body: 'Release notes',
+            published_at: '2025-01-01T00:00:00Z',
+            assets: [
+              {
+                name: 'deployment-manifest.json',
+                url: 'https://api.github.com/repos/test-owner/test-repo/releases/assets/123',
+                browser_download_url: 'https://github.com/.../deployment-manifest.json',
+                size: 1024
+              },
+              {
+                name: 'bundle.zip',
+                url: 'https://api.github.com/repos/test-owner/test-repo/releases/assets/124',
+                browser_download_url: 'https://github.com/.../bundle.zip',
+                size: 2048
+              },
+              {
+                name: 'README.md',
+                url: 'https://api.github.com/repos/test-owner/test-repo/releases/assets/125',
+                browser_download_url: 'https://github.com/.../README.md',
+                size: 512
+              }
+            ]
+          }
+        ]);
+
+      nock('https://api.github.com')
+        .get('/repos/test-owner/test-repo/releases/assets/123')
+        .reply(200, JSON.stringify({ id: 'bundle-1', name: 'Bundle 1', version: '1.0.0' }));
+
+      nock('https://api.github.com')
+        .get('/repos/test-owner/test-repo/releases/assets/125')
+        .reply(200, 'Extremely detailed README with images and figures and all the good stuff （￣︶￣）↗');
+
+      const adapter = new GitHubAdapter(mockSource);
+      const bundles = await adapter.fetchBundles();
+      assert.strictEqual(bundles.length, 1);
+      const readmeContent = await adapter.downloadReadme(bundles[0]);
+      assert.strictEqual(readmeContent, 'Extremely detailed README with images and figures and all the good stuff （￣︶￣）↗');
+    });
+  });
 });
