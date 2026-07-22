@@ -354,12 +354,11 @@ export class FileTreeTargetWriter implements TargetWriter {
     files: ExtractedFiles,
     written: string[]
   ): Promise<boolean> {
-    const sourceSkillId = getSkillName(item.file);
-    if (sourceSkillId === null) {
+    if (getSkillName(item.file) === null) {
       return false;
     }
     const targetSkillId = normalizePromptId(item.id);
-    const sourcePrefix = `skills/${sourceSkillId}/`;
+    const sourcePrefix = `${path.posix.dirname(item.file)}/`;
     let wroteAny = false;
 
     for (const [bundlePath, bytes] of files) {

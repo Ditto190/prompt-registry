@@ -12,6 +12,10 @@ const VSCODEIGNORE_FILE = '.vscodeignore';
 const DEV_IGNORE_FILE = '.vscodeignore.development';
 const PROD_IGNORE_FILE = '.vscodeignore.production';
 
+const EXTENSION_DIR = path.resolve(__dirname, '..');
+const SCHEMAS_DIR = path.join(EXTENSION_DIR, 'schemas');
+const SCHEMAS_SOURCE = path.resolve(__dirname, '..', '..', '..', 'packages', 'core', 'src', 'public', 'schemas');
+
 function fileExists(filePath) {
     try {
         return fs.statSync(filePath).isFile();
@@ -57,6 +61,7 @@ function switchToDevelopment() {
     // Copy development version
     fs.copyFileSync(DEV_IGNORE_FILE, VSCODEIGNORE_FILE);
     console.log('✅ Switched to development .vscodeignore');
+    restoreSchemasSymlink();
     
     // Log what will be included
     console.log('📋 Development mode includes:');
@@ -72,6 +77,7 @@ function restoreBackup() {
         fs.copyFileSync('.vscodeignore.backup', VSCODEIGNORE_FILE);
         fs.unlinkSync('.vscodeignore.backup');
         console.log('✅ Restored .vscodeignore from backup');
+        restoreSchemasSymlink();
     } else {
         // Fallback to development mode
         switchToDevelopment();
@@ -104,6 +110,35 @@ function showStatus() {
     console.log(`   - Production:  ${fileExists(PROD_IGNORE_FILE) ? '✅' : '❌'} ${PROD_IGNORE_FILE}`);
 }
 
+function safeRemoveSchemas() {
+    try {
+        const stat = fs.lstatSync(SCHEMAS_DIR);
+        if (stat.isSymbolicLink()) {
+            fs.unlinkSync(SCHEMAS_DIR);
+        } else {
+            fs.rmSync(SCHEMAS_DIR, { recursive: true, force: true });
+        }
+    } catch (err) {
+        if (err.code !== 'ENOENT') {
+            throw err;
+        }
+    }
+}
+
+function expandSchemas() {
+    console.log('📂 Expanding schemas symlink into real files for packaging...');
+    safeRemoveSchemas();
+    fs.cpSync(SCHEMAS_SOURCE, SCHEMAS_DIR, { recursive: true });
+    console.log('✅ Schemas expanded');
+}
+
+function restoreSchemasSymlink() {
+    console.log('🔗 Restoring schemas symlink...');
+    safeRemoveSchemas();
+    fs.symlinkSync('../../packages/core/src/public/schemas', SCHEMAS_DIR, 'dir');
+    console.log('✅ Schemas symlink restored');
+}
+
 // Command line interface
 const command = process.argv[2];
 
@@ -122,6 +157,12 @@ switch (command) {
     case 'status':
         showStatus();
         break;
+    case 'expand-schemas':
+        expandSchemas();
+        break;
+    case 'restore-schemas':
+        restoreSchemasSymlink();
+        break;
     default:
         console.log('Prompt Registry VS Code Extension Packaging Helpers');
         console.log('');
@@ -132,6 +173,8 @@ switch (command) {
         console.log('  dev, development  - Switch to development .vscodeignore for coding');
         console.log('  restore          - Restore from backup (.vscodeignore.backup)');
         console.log('  status           - Show current ignore mode status');
+        console.log('  expand-schemas   - Expand schemas symlink into real files for packaging');
+        console.log('  restore-schemas  - Restore the schemas symlink after packaging');
         console.log('');
         console.log('Examples:');
         console.log('  npm run package:prepare  # Switch to production mode');

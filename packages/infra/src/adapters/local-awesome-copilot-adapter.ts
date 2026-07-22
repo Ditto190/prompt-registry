@@ -67,6 +67,9 @@ interface CollectionManifest {
   version?: string;
   author?: string;
   tags?: string[];
+  readme?: {
+    path?: string;
+  };
   items: CollectionItem[];
   mcpServers?: Record<string, unknown>;
   mcp?: {
@@ -202,6 +205,10 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
 
   private buildBundle(collection: CollectionManifest, collectionFile: string, mtimeMs: number): Bundle {
     const collectionPath = path.join(this.getCollectionsDir(), collectionFile);
+    const localPath = this.getLocalPath();
+    const readmePath = collection.readme?.path
+      ? path.join(localPath, collection.readme.path)
+      : undefined;
     const bundle: Bundle = {
       id: collection.id,
       name: collection.name,
@@ -217,7 +224,9 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
       lastUpdated: new Date(mtimeMs).toISOString(),
       size: `${collection.items.length} items`,
       dependencies: [],
-      license: 'MIT'
+      license: 'MIT',
+      readmeUrl: readmePath ? `file://${readmePath}` : undefined,
+      readmeRevision: String(mtimeMs)
     };
 
     // Attach a content breakdown + raw MCP servers for the Marketplace
@@ -356,6 +365,18 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
       return await this.createBundleArchive(collection);
     } catch (error) {
       throw new Error(`Failed to download bundle: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  public async downloadReadme(bundle: Bundle): Promise<string | null> {
+    if (!bundle.readmeUrl) {
+      return null;
+    }
+    const localFile = bundle.readmeUrl.replace(/^file:\/\//, '');
+    try {
+      return await this.fs.readFile(localFile);
+    } catch {
+      return null;
     }
   }
 

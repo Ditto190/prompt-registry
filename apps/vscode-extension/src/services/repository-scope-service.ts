@@ -12,6 +12,16 @@ import * as path from 'node:path';
 import {
   promisify,
 } from 'node:util';
+import {
+  FileTreeTargetWriter,
+} from '@ai-primitives-hub/app';
+import type {
+  ManifestPlacementItem,
+  WriterFs,
+} from '@ai-primitives-hub/app';
+import type {
+  Target,
+} from '@ai-primitives-hub/core';
 import * as yaml from 'js-yaml';
 import {
   RegistryStorage,
@@ -24,6 +34,7 @@ import {
   CopilotFileType,
   determineFileType,
   getRepositoryTargetDirectory,
+  getSkillName,
   getTargetFileName,
   normalizePromptId,
 } from '../utils/copilot-file-type-utils';
@@ -46,9 +57,31 @@ const readFile = promisify(fs.readFile);
 const writeFile = promisify(fs.writeFile);
 const readdir = promisify(fs.readdir);
 const unlink = promisify(fs.unlink);
-const copyFile = promisify(fs.copyFile);
-const stat = promisify(fs.stat);
 const rm = promisify(fs.rm);
+
+/**
+ * `WriterFs` adapter backed by Node's `fs` module, so
+ * `RepositoryScopeService` can drive the shared
+ * `FileTreeTargetWriter.writeManifestItems()` placement/naming logic
+ * instead of duplicating it.
+ */
+class NodeWriterFs implements WriterFs {
+  public async writeFile(p: string, contents: string): Promise<void> {
+    await writeFile(p, contents, 'utf8');
+  }
+
+  public async mkdir(p: string, opts?: { recursive?: boolean }): Promise<void> {
+    await fs.promises.mkdir(p, opts);
+  }
+
+  public async remove(p: string): Promise<void> {
+    await rm(p, { recursive: true, force: true });
+  }
+
+  public exists(p: string): Promise<boolean> {
+    return Promise.resolve(fs.existsSync(p));
+  }
+}
 
 /**
  * Section header for AI Primitives Hub entries in .git/info/exclude
@@ -171,7 +204,13 @@ export class RepositoryScopeService implements IScopeService {
   }
 
   /**
-   * Copy all files from a bundle to their target .github/ directories
+   * Copy all files from a bundle to their target .github/ directories.
+   *
+   * Placement/naming is delegated to the shared
+   * `FileTreeTargetWriter.writeManifestItems()`,
+   * called once per manifest item so this service's own
+   * per-item rollback tracking (see `InstallationTracker`) is preserved
+   * exactly as before.
    * @param bundlePath
    * @param manifest
    * @param tracker
@@ -181,42 +220,73 @@ export class RepositoryScopeService implements IScopeService {
     manifest: DeploymentManifest,
     tracker: InstallationTracker
   ): Promise<void> {
+    const target: Target = { name: 'repository', type: 'vscode', scope: 'repository', rootPath: this.workspaceRoot };
+    const writer = new FileTreeTargetWriter({ fs: new NodeWriterFs(), env: process.env });
+
     for (const promptDef of manifest.prompts || []) {
       const promptId = normalizePromptId(promptDef.id);
 
-      await (promptDef.type === 'skill' ? this.installSkillAndTrack(bundlePath, promptDef.file, promptId, tracker) : this.installFileAndTrack(bundlePath, promptDef, promptId, tracker));
+      await (promptDef.type === 'skill'
+        ? this.installSkillAndTrack(writer, target, bundlePath, promptDef.file, promptId, tracker)
+        : this.installFileAndTrack(writer, target, bundlePath, promptDef, promptId, tracker));
     }
   }
 
   /**
    * Install a skill directory and track for potential rollback
+   * @param writer - Shared writer that places the skill's files.
+   * @param target - Target describing this workspace's repository scope.
    * @param bundlePath
    * @param skillFile
    * @param skillId
    * @param tracker
    */
   private async installSkillAndTrack(
+    writer: FileTreeTargetWriter,
+    target: Target,
     bundlePath: string,
     skillFile: string,
     skillId: string,
     tracker: InstallationTracker
   ): Promise<void> {
-    const skillPaths = await this.installSkillDirectory(bundlePath, skillFile, skillId);
+    const sourceSkillName = getSkillName(skillFile);
+    if (!sourceSkillName) {
+      this.logger.warn(`[RepositoryScopeService] Invalid skill path format: ${skillFile}`);
+      return;
+    }
 
-    if (skillPaths.length > 0) {
+    const sourceDir = path.join(bundlePath, path.dirname(skillFile));
+    if (!fs.existsSync(sourceDir)) {
+      this.logger.warn(`[RepositoryScopeService] Skill directory not found: ${sourceDir}`);
+      return;
+    }
+    if (!fs.statSync(sourceDir).isDirectory()) {
+      this.logger.warn(`[RepositoryScopeService] Skill path is not a directory: ${sourceDir}`);
+      return;
+    }
+
+    const files = await this.readDirectoryIntoMap(sourceDir, path.dirname(skillFile));
+    const item: ManifestPlacementItem = { id: skillId, file: skillFile, type: 'skill' };
+    const result = await writer.writeManifestItems(target, files, [item]);
+
+    if (result.written.length > 0) {
       const skillDir = path.join(
         this.workspaceRoot,
         getRepositoryTargetDirectory('skill'),
         skillId
       );
       tracker.skillDirs.push(skillDir);
-      tracker.relativePaths.push(...skillPaths.map((p) => this.getRelativePath(p)));
-      tracker.absolutePaths.push(...skillPaths);
+      tracker.relativePaths.push(...result.written.map((p) => this.getRelativePath(p)));
+      tracker.absolutePaths.push(...result.written);
     }
+
+    this.logger.debug(`[RepositoryScopeService] Installed skill ${skillId}: ${result.written.length} files`);
   }
 
   /**
    * Install a single file and track for potential rollback
+   * @param writer - Shared writer that places the file.
+   * @param target - Target describing this workspace's repository scope.
    * @param bundlePath
    * @param promptDef
    * @param promptDef.file
@@ -226,6 +296,8 @@ export class RepositoryScopeService implements IScopeService {
    * @param tracker
    */
   private async installFileAndTrack(
+    writer: FileTreeTargetWriter,
+    target: Target,
     bundlePath: string,
     promptDef: { file: string; type?: string; tags?: string[] },
     promptId: string,
@@ -241,11 +313,17 @@ export class RepositoryScopeService implements IScopeService {
     }
 
     const fileType = promptDef.type as CopilotFileType || determineFileType(promptDef.file, promptDef.tags);
-    const targetPath = this.getTargetPath(fileType, promptId);
-    this.logger.info(`[RepositoryScopeService] File type: ${fileType}, Target path: ${targetPath}`);
+    const files = new Map<string, Uint8Array>([[promptDef.file, await readFile(sourcePath)]]);
+    const item: ManifestPlacementItem = { id: promptId, file: promptDef.file, type: fileType, tags: promptDef.tags };
+    const result = await writer.writeManifestItems(target, files, [item]);
 
-    await this.ensureDir(path.dirname(targetPath));
-    await copyFile(sourcePath, targetPath);
+    if (result.written.length === 0) {
+      this.logger.warn(`[RepositoryScopeService] Failed to place file: ${sourcePath}`);
+      return;
+    }
+
+    const targetPath = result.written[0];
+    this.logger.info(`[RepositoryScopeService] File type: ${fileType}, Target path: ${targetPath}`);
     this.logger.info(`[RepositoryScopeService] ✅ Copied: ${sourcePath} → ${targetPath}`);
 
     tracker.absolutePaths.push(targetPath);
@@ -299,77 +377,34 @@ export class RepositoryScopeService implements IScopeService {
   }
 
   /**
-   * Install a skill directory by copying all files recursively
-   * @param bundlePath - Path to the bundle directory
-   * @param skillFile - Relative path to the skill directory in the bundle
-   * @param skillId - The skill identifier
-   * @returns Array of absolute paths to installed files
+   * Recursively read a directory's files into an in-memory map keyed by
+   * bundle-relative path (e.g. `skills/my-skill/scripts/run.sh`), for
+   * `FileTreeTargetWriter.writeManifestItems()`'s skill-copy mode, which
+   * expects every file under the skill's bundle-relative prefix to be
+   * present in the `ExtractedFiles` map it's given.
+   * @param sourceDir - Absolute source directory path.
+   * @param relativePrefix - Bundle-relative path prefix used for map keys.
+   * @returns Map of bundle-relative path to file bytes.
    */
-  private async installSkillDirectory(
-    bundlePath: string,
-    skillFile: string,
-    skillId: string
-  ): Promise<string[]> {
-    const sourcePath = path.join(bundlePath, path.dirname(skillFile));
-
-    if (!fs.existsSync(sourcePath)) {
-      this.logger.warn(`[RepositoryScopeService] Skill directory not found: ${sourcePath}`);
-      return [];
-    }
-
-    const sourceStats = await stat(sourcePath);
-    if (!sourceStats.isDirectory()) {
-      this.logger.warn(`[RepositoryScopeService] Skill path is not a directory: ${sourcePath}`);
-      return [];
-    }
-
-    // Target directory: .github/skills/<skill-id>/
-    const targetDir = path.join(
-      this.workspaceRoot,
-      getRepositoryTargetDirectory('skill'),
-      skillId
-    );
-
-    // Ensure target directory exists
-    await this.ensureDir(targetDir);
-
-    // Copy all files recursively
-    const installedFiles = await this.copyDirectoryRecursive(sourcePath, targetDir);
-
-    this.logger.debug(`[RepositoryScopeService] Installed skill ${skillId}: ${installedFiles.length} files`);
-
-    return installedFiles;
-  }
-
-  /**
-   * Recursively copy a directory and all its contents
-   * @param sourceDir - Source directory path
-   * @param targetDir - Target directory path
-   * @returns Array of absolute paths to copied files
-   */
-  private async copyDirectoryRecursive(sourceDir: string, targetDir: string): Promise<string[]> {
-    const copiedFiles: string[] = [];
-
+  private async readDirectoryIntoMap(sourceDir: string, relativePrefix: string): Promise<Map<string, Uint8Array>> {
+    const files = new Map<string, Uint8Array>();
     const entries = await readdir(sourceDir, { withFileTypes: true });
 
     for (const entry of entries) {
-      const sourcePath = path.join(sourceDir, entry.name);
-      const targetPath = path.join(targetDir, entry.name);
+      const entryPath = path.join(sourceDir, entry.name);
+      const entryPrefix = `${relativePrefix}/${entry.name}`;
 
       if (entry.isDirectory()) {
-        // Create subdirectory and recurse
-        await this.ensureDir(targetPath);
-        const subFiles = await this.copyDirectoryRecursive(sourcePath, targetPath);
-        copiedFiles.push(...subFiles);
+        const nested = await this.readDirectoryIntoMap(entryPath, entryPrefix);
+        for (const [key, value] of nested) {
+          files.set(key, value);
+        }
       } else if (entry.isFile()) {
-        // Copy file
-        await copyFile(sourcePath, targetPath);
-        copiedFiles.push(targetPath);
-        this.logger.debug(`[RepositoryScopeService] Copied skill file: ${entry.name}`);
+        files.set(entryPrefix, await readFile(entryPath));
       }
     }
 
-    return copiedFiles;
+    return files;
   }
 
   /**

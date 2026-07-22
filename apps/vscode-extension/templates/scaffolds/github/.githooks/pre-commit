@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Pre-commit hook for validating collections and skills
-# Uses @prompt-registry/collection-scripts from npm
+# Uses @ai-primitives-hub/cli from npm
 
 echo "🔍 Running pre-commit validation..."
 

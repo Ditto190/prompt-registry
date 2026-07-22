@@ -104,16 +104,13 @@ suite('UserScopeService - WSL Support', () => {
       const service = new UserScopeService(mockContext);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
-      assert.strictEqual(promptsDir, path.join(windowsHome, 'AppData', 'Roaming', 'Code', 'User', 'prompts'));
+      assert.strictEqual(promptsDir, path.join(windowsHome, '.copilot', 'prompts'));
     });
 
-    const uriSchemeCases: Map<string, string> = new Map([
-      ['vscode', 'Code'],
-      ['vscode-insiders', 'Code - Insiders']
-    ]);
+    const uriSchemeCases: string[] = ['vscode', 'vscode-insiders'];
 
-    uriSchemeCases.forEach((expectedFolder, uriScheme) => {
-      test(`should map uriScheme '${uriScheme}' to folder '${expectedFolder}'`, async () => {
+    uriSchemeCases.forEach((uriScheme) => {
+      test(`should use the generic Copilot path for uriScheme '${uriScheme}'`, async () => {
         const windowsHome = path.join(tempDir, 'mnt', 'c', 'Users', 'testuser');
         const globalStorage = path.join(tempDir, 'wsl-home');
         stubWSLEnvironment(windowsHome, uriScheme);
@@ -121,11 +118,11 @@ suite('UserScopeService - WSL Support', () => {
         const service = new UserScopeService(mockContext);
         const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
-        assert.ok(promptsDir.includes(expectedFolder));
+        assert.strictEqual(promptsDir, path.join(windowsHome, '.copilot', 'prompts'));
       });
     });
 
-    test('should fall back to Code when uriScheme is unknown', async () => {
+    test('should use the generic Copilot path when uriScheme is unknown', async () => {
       const windowsHome = path.join(tempDir, 'mnt', 'c', 'Users', 'testuser');
       const globalStorage = path.join(tempDir, 'wsl-home');
       stubWSLEnvironment(windowsHome, 'unknown-ide');
@@ -133,8 +130,7 @@ suite('UserScopeService - WSL Support', () => {
       const service = new UserScopeService(mockContext);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
-      assert.ok(promptsDir.includes(path.join('Code', '')), `Expected path to include Code directory but got: ${promptsDir}`);
-      assert.ok(!promptsDir.includes('Insiders'), `Expected path to NOT include 'Insiders' but got: ${promptsDir}`);
+      assert.strictEqual(promptsDir, path.join(windowsHome, '.copilot', 'prompts'));
     });
 
     test('should fall through to globalStorageUri parsing when wslpath fails', async () => {
@@ -143,10 +139,10 @@ suite('UserScopeService - WSL Support', () => {
       const showWarningStub = sandbox.stub(vscode.window, 'showWarningMessage');
       const globalStorage = path.join(tempDir, 'data', 'User', 'globalStorage');
       const mockContext = createMockContext(globalStorage);
-      const service = new UserScopeService(mockContext);
+      const service = new UserScopeService(mockContext, tempDir);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
-      assert.ok(promptsDir.endsWith(path.join('User', 'prompts')));
+      assert.strictEqual(promptsDir, path.join(tempDir, '.copilot', 'prompts'));
       assert.ok(showWarningStub.calledOnce, 'Expected a warning message when WSL path resolution fails');
       assert.ok(
         showWarningStub.firstCall.args[0].includes('Unable to resolve Windows path from WSL'),
@@ -181,7 +177,7 @@ suite('UserScopeService - WSL Support', () => {
       const service = new UserScopeService(mockContext);
       await service.syncBundle(bundleId, bundlePath);
 
-      const targetFile = path.join(windowsUserDir, 'AppData', 'Roaming', 'Code', 'User', 'prompts', 'my-prompt.prompt.md');
+      const targetFile = path.join(windowsUserDir, '.copilot', 'prompts', 'my-prompt.prompt.md');
       assert.ok(fs.existsSync(targetFile), 'Target file should exist');
       assert.ok(!fs.lstatSync(targetFile).isSymbolicLink(), 'Target should be a regular file, not a symlink');
       assert.strictEqual(fs.readFileSync(targetFile, 'utf8'), promptContent);
@@ -214,7 +210,7 @@ suite('UserScopeService - WSL Support', () => {
 
       await service.syncBundle(bundleId, bundlePath);
 
-      const targetFile = path.join(windowsUserDir, 'AppData', 'Roaming', 'Code', 'User', 'prompts', 'my-prompt.prompt.md');
+      const targetFile = path.join(windowsUserDir, '.copilot', 'prompts', 'my-prompt.prompt.md');
       assert.ok(fs.existsSync(targetFile), 'File should exist after sync');
 
       // Simulate Windows converting LF → CRLF
@@ -242,7 +238,7 @@ suite('UserScopeService - WSL Support', () => {
 
       const globalStorage = path.join(tempDir, 'Code', 'User', 'globalStorage', 'pub.ext');
       const mockContext = createMockContext(globalStorage);
-      const service = new UserScopeService(mockContext);
+      const service = new UserScopeService(mockContext, tempDir);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
       assert.ok(!promptsDir.includes('/mnt/'), `Local should not use WSL mount, got: ${promptsDir}`);
@@ -254,11 +250,11 @@ suite('UserScopeService - WSL Support', () => {
 
       const globalStorage = path.join(tempDir, 'data', 'User', 'globalStorage', 'pub.ext');
       const mockContext = createMockContext(globalStorage);
-      const service = new UserScopeService(mockContext);
+      const service = new UserScopeService(mockContext, tempDir);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
       assert.ok(!promptsDir.includes('/mnt/'), `SSH should not use WSL mount, got: ${promptsDir}`);
-      assert.strictEqual(promptsDir, path.join(tempDir, 'data', 'User', 'prompts'));
+      assert.strictEqual(promptsDir, path.join(tempDir, '.copilot', 'prompts'));
     });
 
     test('should NOT activate WSL mode when remoteName is tunnel', async () => {
@@ -266,7 +262,7 @@ suite('UserScopeService - WSL Support', () => {
 
       const globalStorage = path.join(tempDir, 'data', 'User', 'globalStorage', 'pub.ext');
       const mockContext = createMockContext(globalStorage);
-      const service = new UserScopeService(mockContext);
+      const service = new UserScopeService(mockContext, tempDir);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
       assert.ok(!promptsDir.includes('/mnt/'), `Tunnel should not use WSL mount, got: ${promptsDir}`);
@@ -279,7 +275,7 @@ suite('UserScopeService - WSL Support', () => {
 
       const globalStorage = path.join(tempDir, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'pub.ext');
       const mockContext = createMockContext(globalStorage);
-      const service = new UserScopeService(mockContext);
+      const service = new UserScopeService(mockContext, tempDir);
       const promptsDir = await getResolvedPromptsDir(service, globalStorage);
 
       assert.ok(typeof promptsDir === 'string', 'Should return a valid string path');

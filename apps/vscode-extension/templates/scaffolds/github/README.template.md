@@ -48,7 +48,7 @@ AI Primitives Hub is a comprehensive platform that enables:
 
 ### 1. Install Dependencies
 
-This project uses `@prompt-registry/collection-scripts` from npmjs.com.
+This project uses `@ai-primitives-hub/cli` from npmjs.com.
 
 ```bash
 # Install dependencies
@@ -417,19 +417,19 @@ See `mcp-server/README.md` for available servers and custom implementation guide
 npm run validate
 npm run skill:validate
 
-# Or with Node directly
-node validate-collections.js
-node scripts/validate-skills.js
+# Or with npx directly
+npx ai-primitives-hub collection validate
+npx ai-primitives-hub skill validate
 ```
 
 ### CI/CD (GitHub Actions)
 
-The included workflow (`.github/workflows/validate-collections.yml`) runs automatically:
+The included workflow (`.github/workflows/publish.yml`) runs automatically:
 
 - ✅ On every push to `main`/`develop`
 - ✅ On pull requests
-- ✅ Reports validation errors
-- ✅ Blocks merge if validation fails
+- ✅ Validates collections and skills
+- ✅ Publishes affected bundles as releases
 
 ### Manual Testing
 

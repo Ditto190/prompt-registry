@@ -180,9 +180,8 @@ suite('copilotFileTypeUtils', () => {
       assert.strictEqual(getRepositoryTargetDirectory('instructions'), '.github/instructions/');
     });
 
-    test('should return .github/prompts/ for chatmode type', () => {
-      // Chatmodes go to prompts directory per VS Code Copilot conventions
-      assert.strictEqual(getRepositoryTargetDirectory('chatmode'), '.github/prompts/');
+    test('should return .github/agents/ for chatmode type', () => {
+      assert.strictEqual(getRepositoryTargetDirectory('chatmode'), '.github/agents/');
     });
 
     test('should return .github/agents/ for agent type', () => {

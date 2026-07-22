@@ -206,11 +206,11 @@ suite('RepositoryScopeService Property Tests', () => {
       // Verify expected mappings
       assert.strictEqual(directories.prompt, '.github/prompts/');
       assert.strictEqual(directories.instructions, '.github/instructions/');
-      assert.strictEqual(directories.chatmode, '.github/prompts/'); // Chatmodes go to prompts
+      assert.strictEqual(directories.chatmode, '.github/agents/'); // Chatmodes are associated with agents
       assert.strictEqual(directories.agent, '.github/agents/');
       assert.strictEqual(directories.skill, '.github/skills/');
 
-      // Verify distinct directories (except chatmode which shares with prompt)
+      // Verify distinct directories (except chatmode which shares with agent)
       const uniqueDirs = new Set([
         directories.prompt,
         directories.instructions,

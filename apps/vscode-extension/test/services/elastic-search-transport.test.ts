@@ -22,22 +22,25 @@ suite('ElasticSearchTransport', () => {
   let closeStub: sinon.SinonStub;
   let lastClientOptions: any;
 
-  const esModule = require('@elastic/elasticsearch');
-  const originalClient = esModule.Client;
-
-  // Production code does `import * as tls from 'node:tls'`, which TypeScript
-  // compiles to an __importStar copy whose properties are live getters onto the
-  // real module. Stubbing the real module is therefore visible to production
-  // code; stubbing a local `import * as tls` copy is not (and its descriptors
-  // are non-configurable). So we stub the real module directly.
-  const tlsModule = require('node:tls');
-  const originalGetCACertificates = tlsModule.getCACertificates;
-
   const createMockEsClient = () => ({
     indices: { create: indicesCreateStub },
     helpers: { bulk: bulkStub },
     close: closeStub
   }) as any;
+
+  // Injected via the constructor (mocking the ES SDK boundary, not an
+  // internal collaborator) rather than monkeypatching the real
+  // `@elastic/elasticsearch` module: `ElasticSearchTransport` delegates to
+  // `@ai-primitives-hub/infra`'s ported transport, which resolves its own
+  // (pnpm-nested) copy of the SDK — a different module instance than this
+  // extension's — so stubbing the extension's copy would have no effect.
+  const buildTransport = (getCACertificates?: (store: 'system' | 'default') => string[]): ElasticSearchTransport => new ElasticSearchTransport({
+    createClient: (options: any) => {
+      lastClientOptions = options;
+      return createMockEsClient();
+    },
+    getCACertificates
+  });
 
   const baseConfig: ElasticSearchConfig = {
     node: 'https://es-proxy.example.com:8080'
@@ -52,21 +55,15 @@ suite('ElasticSearchTransport', () => {
     closeStub = sandbox.stub().resolves();
     lastClientOptions = undefined;
 
-    Object.defineProperty(esModule, 'Client', { value: originalClient, writable: true, configurable: true });
-    // eslint-disable-next-line prefer-arrow/prefer-arrow-functions -- must be a constructor for `new`
-    esModule.Client = function stubClient(options: any) {
-      lastClientOptions = options;
-      return createMockEsClient();
-    };
-
-    transport = new ElasticSearchTransport();
+    // No CA-certificate reader by default — deterministic regardless of the
+    // host's Node version. Tests exercising CA-merging build their own
+    // transport via `buildTransport(stubReader)`.
+    transport = buildTransport();
   });
 
   teardown(() => {
     transport.dispose();
     clock.restore();
-    esModule.Client = originalClient;
-    tlsModule.getCACertificates = originalGetCACertificates;
     sandbox.restore();
   });
 
@@ -82,31 +79,30 @@ suite('ElasticSearchTransport', () => {
       // Netskope (and other corporate TLS-inspection) CAs live in the OS trust
       // store, which Node ignores by default. The transport must merge them in
       // so the proxy's re-signed certificate validates.
-      const getCaStub = sandbox.stub(tlsModule, 'getCACertificates');
-      getCaStub.withArgs('system').returns(['-----SYSTEM CA-----']);
-      getCaStub.withArgs('default').returns(['-----DEFAULT CA-----']);
+      const withCa = buildTransport((store) => (store === 'system' ? ['-----SYSTEM CA-----'] : ['-----DEFAULT CA-----']));
 
-      await transport.registerHub('hub-1', baseConfig);
+      await withCa.registerHub('hub-1', baseConfig);
 
       assert.ok(Array.isArray(lastClientOptions.tls?.ca), 'expected tls.ca to be an array');
       assert.ok(lastClientOptions.tls.ca.includes('-----SYSTEM CA-----'), 'expected system CA');
       assert.ok(lastClientOptions.tls.ca.includes('-----DEFAULT CA-----'), 'expected default CA bundle');
+
+      withCa.dispose();
     });
 
     test('should not set tls.ca when the system trust store is empty', async () => {
-      const getCaStub = sandbox.stub(tlsModule, 'getCACertificates');
-      getCaStub.withArgs('system').returns([]);
-      getCaStub.withArgs('default').returns(['-----DEFAULT CA-----']);
+      const withCa = buildTransport((store) => (store === 'system' ? [] : ['-----DEFAULT CA-----']));
 
-      await transport.registerHub('hub-1', baseConfig);
+      await withCa.registerHub('hub-1', baseConfig);
 
       assert.strictEqual(lastClientOptions.tls?.ca, undefined);
+
+      withCa.dispose();
     });
 
     test('should register successfully when tls.getCACertificates is unavailable', async () => {
       // Older Node runtimes (VS Code < ~1.103) lack tls.getCACertificates.
-      tlsModule.getCACertificates = undefined;
-
+      // The shared `transport` from setup() already has no CA reader injected.
       await transport.registerHub('hub-1', baseConfig);
 
       assert.strictEqual(indicesCreateStub.callCount, 1);
@@ -118,7 +114,7 @@ suite('ElasticSearchTransport', () => {
 
       assert.strictEqual(indicesCreateStub.callCount, 1);
       const indexArg = indicesCreateStub.firstCall.args[0];
-      assert.ok(indexArg.index.startsWith('prompt-registry-telemetry-'));
+      assert.ok(indexArg.index.startsWith('ai-primitives-hub-telemetry-'));
     });
 
     test('should use custom indexPrefix when provided', async () => {

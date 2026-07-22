@@ -7,20 +7,29 @@
  */
 
 import {
+  bundleIdentitiesMatch,
+  bundleIdHasVersionSuffix,
+  extractBaseBundleId,
+} from '@ai-primitives-hub/core';
+import {
   SourceType,
 } from '../types/registry';
-import {
-  VersionManager,
-} from './version-manager';
 
 /**
- * Version suffix regex pattern used across the codebase
+ * Version suffix regex pattern used across the codebase.
+ * Re-exported from `@ai-primitives-hub/core`'s `domain/bundle/identity-matcher`
  */
-export const VERSION_SUFFIX_REGEX = /-v?\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[\w.]+)?$/;
+export {
+  VERSION_SUFFIX_REGEX,
+} from '@ai-primitives-hub/core';
 
 /**
  * Bundle Identity Matcher
- * Centralized utility for comparing bundle identities
+ * Centralized utility for comparing bundle identities.
+ *
+ * Thin delegator to `@ai-primitives-hub/core`'s pure
+ * `domain/bundle/identity-matcher` functions — kept as this same object
+ * shape so existing call sites across the extension are unchanged.
  */
 // eslint-disable-next-line @typescript-eslint/naming-convention -- name reflects domain terminology
 export const BundleIdentityMatcher = {
@@ -52,15 +61,7 @@ export const BundleIdentityMatcher = {
     bundleId2: string,
     sourceType: SourceType
   ): boolean => {
-    if (sourceType === 'github') {
-      // For GitHub, extract identity without version suffix
-      const identity1 = VersionManager.extractBundleIdentity(bundleId1, sourceType);
-      const identity2 = VersionManager.extractBundleIdentity(bundleId2, sourceType);
-      return identity1 === identity2;
-    }
-
-    // For non-GitHub sources, exact match required
-    return bundleId1 === bundleId2;
+    return bundleIdentitiesMatch(bundleId1, bundleId2, sourceType);
   },
 
   /**
@@ -74,7 +75,7 @@ export const BundleIdentityMatcher = {
    * ```
    */
   extractBaseId: (bundleId: string): string => {
-    return bundleId.replace(VERSION_SUFFIX_REGEX, '');
+    return extractBaseBundleId(bundleId);
   },
 
   /**
@@ -83,6 +84,6 @@ export const BundleIdentityMatcher = {
    * @returns True if bundle ID contains version suffix
    */
   hasVersionSuffix: (bundleId: string): boolean => {
-    return VERSION_SUFFIX_REGEX.test(bundleId);
+    return bundleIdHasVersionSuffix(bundleId);
   }
 };

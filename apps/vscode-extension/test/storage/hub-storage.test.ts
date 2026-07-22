@@ -119,15 +119,20 @@ suite('HubStorage - TDD', () => {
     });
 
     test('should handle save errors gracefully', async () => {
-      const fileStoragePath = path.join(tempDir, 'not-a-directory');
-      fs.writeFileSync(fileStoragePath, 'test content');
+      // Create a read-only directory
+      const readOnlyDir = path.join(tempDir, 'readonly');
+      fs.mkdirSync(readOnlyDir, { recursive: true });
+      fs.chmodSync(readOnlyDir, 0o444);
 
-      const invalidStorage = new HubStorage(fileStoragePath);
+      const readOnlyStorage = new HubStorage(readOnlyDir);
 
       await assert.rejects(
-        async () => await invalidStorage.saveHub('test', testHubConfig, testHubReference),
+        async () => await readOnlyStorage.saveHub('test', testHubConfig, testHubReference),
         /Failed to save hub/
       );
+
+      // Restore permissions for cleanup
+      fs.chmodSync(readOnlyDir, 0o755);
     });
 
     test('should overwrite existing hub config', async () => {

@@ -1,12 +1,12 @@
 /**
  * Bundle ID Synchronization Tests
  *
- * Verifies that the TypeScript runtime implementation and the shared library
+ * Verifies that the TypeScript runtime implementation and the canonical core
  * implementation produce identical bundle IDs.
  *
  * This is critical because:
  * - Runtime (TS): src/utils/bundle-name-utils.ts - generateBuildScriptBundleId
- * - Shared library: `@prompt-registry/collection-scripts` - generateBundleId
+ * - Canonical: `@ai-primitives-hub/core` - generateBundleId
  *
  * If these drift, bundles built by CI won't match what the runtime expects.
  */
@@ -14,7 +14,7 @@
 import * as assert from 'node:assert';
 import {
   generateBundleId,
-} from '@prompt-registry/collection-scripts';
+} from '@ai-primitives-hub/core';
 import {
   generateBuildScriptBundleId,
 } from '../../src/utils/bundle-name-utils';

@@ -23,8 +23,8 @@ suite('UserScopeService - Unsync Bundle Fix', () => {
     const globalStorageDir = path.join(userDir, 'globalStorage', 'prompt-registry');
 
     bundlesDir = path.join(globalStorageDir, 'bundles');
-    // Default prompts dir is .../User/prompts
-    copilotDir = path.join(userDir, 'prompts');
+    // Default prompts dir is .../.copilot/prompts
+    copilotDir = path.join(tempDir, '.copilot', 'prompts');
 
     fs.mkdirSync(bundlesDir, { recursive: true });
     fs.mkdirSync(copilotDir, { recursive: true });
@@ -37,7 +37,7 @@ suite('UserScopeService - Unsync Bundle Fix', () => {
       subscriptions: []
     } as any;
 
-    service = new UserScopeService(context);
+    service = new UserScopeService(context, tempDir);
   });
 
   teardown(() => {

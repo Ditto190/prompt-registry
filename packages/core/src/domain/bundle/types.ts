@@ -43,6 +43,12 @@ export interface Bundle {
     algorithm: string;
     hash: string;
   };
+  /** URL to the README asset (if available). */
+  readmeUrl?: string;
+  /** Cached README text content. */
+  readme?: string;
+  /** Source revision the cached readme corresponds to (e.g. release tag, commit sha). */
+  readmeRevision?: string;
 }
 
 /**

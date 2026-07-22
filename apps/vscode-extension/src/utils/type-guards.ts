@@ -3,52 +3,12 @@
  * Provides safe type validation for external data
  */
 
-import {
-  BundleUpdate,
-} from '../types/registry';
-
 /**
  * Type guard for array validation
  * @param value
  */
 export function isArray<T>(value: unknown): value is T[] {
   return Array.isArray(value);
-}
-
-/**
- * Type guard for BundleUpdate array
- * @param value
- */
-export function isBundleUpdateArray(value: unknown): value is BundleUpdate[] {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-
-  return value.every((item) =>
-    typeof item === 'object'
-    && item !== null
-    && typeof item.bundleId === 'string'
-    && typeof item.currentVersion === 'string'
-    && typeof item.latestVersion === 'string'
-  );
-}
-
-/**
- * Type guard for source array
- * @param value
- */
-export function isSourceArray(value: unknown): value is { id: string; type: string; name: string }[] {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-
-  return value.every((item) =>
-    typeof item === 'object'
-    && item !== null
-    && typeof item.id === 'string'
-    && typeof item.type === 'string'
-    && typeof item.name === 'string'
-  );
 }
 
 /**

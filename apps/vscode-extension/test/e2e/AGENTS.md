@@ -209,13 +209,13 @@ teardown(() => { sandbox.restore(); });
 
 ## Adapter Cache Handling
 
-`AwesomeCopilotAdapter` caches bundles for 5 minutes. Clear it when simulating content changes:
+`AwesomeCopilotAdapter` (and `GitHubAdapter`) cache bundles/manifests for a TTL. Clear it when simulating content changes, via the adapter's own `clearCache`/`clearManifestCache` method (never reach into a private cache field directly):
 
 ```typescript
 const adapters = (testContext.registryManager as any).adapters;
 for (const [, adapter] of adapters) {
-  if (adapter.collectionsCache) {
-    adapter.collectionsCache.clear();
+  if (typeof adapter.clearCache === 'function') {
+    adapter.clearCache();
   }
 }
 ```

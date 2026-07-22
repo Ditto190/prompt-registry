@@ -2,35 +2,40 @@
  * Main Registry Manager
  * Orchestrates all registry operations including sources, bundles, profiles, and installations
  */
+
+import {
+  activateRegistryProfile,
+  createLocalProfile,
+  deactivateRegistryProfile,
+  deleteLocalProfile,
+  detectBundleUpdates,
+  exportLocalProfile,
+  exportRegistrySettings,
+  importLocalProfile,
+  importRegistrySettings,
+  installRegistryBundle,
+  isHubProfile as isAppHubProfile,
+  listAllProfiles,
+  listInstalledBundles as listInstalledBundlesCore,
+  listLocalProfiles as listLocalProfilesCore,
+  searchRegistryBundles,
+  uninstallInstalledBundle,
+  updateLocalProfile,
+  updateRegistryBundle,
+} from '@ai-primitives-hub/app';
+import type {
+  LogEvent,
+} from '@ai-primitives-hub/app';
+import {
+  GitHubAdapter as InfraGitHubAdapter,
+} from '@ai-primitives-hub/infra';
 import * as vscode from 'vscode';
 import {
-  ApmAdapter,
-} from '../adapters/apm-adapter';
-import {
-  AwesomeCopilotAdapter,
-} from '../adapters/awesome-copilot-adapter';
-import {
-  GitHubAdapter,
-} from '../adapters/github-adapter';
-import {
-  LocalAdapter,
-} from '../adapters/local-adapter';
-import {
-  LocalApmAdapter,
-} from '../adapters/local-apm-adapter';
-import {
-  LocalAwesomeCopilotAdapter,
-} from '../adapters/local-awesome-copilot-adapter';
-import {
-  LocalSkillsAdapter,
-} from '../adapters/local-skills-adapter';
+  createRegistryAdapter,
+} from '../adapters/infra-adapter-factory';
 import {
   IRepositoryAdapter,
-  RepositoryAdapterFactory,
 } from '../adapters/repository-adapter';
-import {
-  SkillsAdapter,
-} from '../adapters/skills-adapter';
 import {
   RegistryStorage,
 } from '../storage/registry-storage';
@@ -42,7 +47,6 @@ import {
   InstalledBundle,
   InstallOptions,
   Profile,
-  ProfileBundle,
   RegistrySource,
   SearchQuery,
   SourceSyncedEvent,
@@ -50,7 +54,6 @@ import {
   ValidationResult,
 } from '../types/registry';
 import {
-  ExportedSettings,
   ExportFormat,
   ImportStrategy,
 } from '../types/settings';
@@ -190,16 +193,6 @@ export class RegistryManager {
     // Initialize version consolidator with source type resolver
     this.versionConsolidator = new VersionConsolidator();
     this.versionConsolidator.setSourceTypeResolver((sourceId: string) => this.getSourceType(sourceId));
-
-    // Register default adapters
-    RepositoryAdapterFactory.register('github', GitHubAdapter);
-    RepositoryAdapterFactory.register('local', LocalAdapter);
-    RepositoryAdapterFactory.register('awesome-copilot', AwesomeCopilotAdapter);
-    RepositoryAdapterFactory.register('local-awesome-copilot', LocalAwesomeCopilotAdapter);
-    RepositoryAdapterFactory.register('local-apm', LocalApmAdapter);
-    RepositoryAdapterFactory.register('apm', ApmAdapter);
-    RepositoryAdapterFactory.register('skills', SkillsAdapter);
-    RepositoryAdapterFactory.register('local-skills', LocalSkillsAdapter);
   }
 
   /**
@@ -239,7 +232,7 @@ export class RegistryManager {
       if (source.enabled) {
         try {
           const enrichedSource = this.enrichSourceWithGlobalToken(source);
-          const adapter = RepositoryAdapterFactory.create(enrichedSource);
+          const adapter = createRegistryAdapter(enrichedSource);
           this.adapters.set(source.id, adapter);
         } catch (error) {
           this.logger.error(`Failed to create adapter for source '${source.id}'`, error as Error);
@@ -299,7 +292,7 @@ export class RegistryManager {
 
     if (!adapter) {
       const enrichedSource = this.enrichSourceWithGlobalToken(source);
-      adapter = RepositoryAdapterFactory.create(enrichedSource);
+      adapter = createRegistryAdapter(enrichedSource);
       this.adapters.set(source.id, adapter);
     }
 
@@ -487,283 +480,6 @@ export class RegistryManager {
   }
 
   /**
-   * Clean up old versions of a bundle when a new version is installed
-   * This handles downgrades and version changes by removing previous installation records
-   * @param bundle The newly installed bundle
-   * @param scope The installation scope (user, workspace, or repository)
-   */
-  private async cleanupOldVersions(bundle: Bundle, scope: InstallationScope): Promise<void> {
-    // Repository scope cleanup is handled by LockfileManager
-    if (scope === 'repository') {
-      return;
-    }
-    try {
-      // Get source information to determine sourceType
-      const source = await this.getSourceForBundle(bundle);
-      const sourceType = source.type;
-
-      // Get the base bundle identity (without version suffix)
-      const baseIdentity = VersionManager.extractBundleIdentity(bundle.id, sourceType);
-
-      // Get all installed bundles in this scope
-      // OPTIMIZATION: Filter early by sourceId to reduce iterations
-      const allInstalled = await this.storage.getInstalledBundles(scope);
-      const candidateBundles = allInstalled.filter((installed) => installed.sourceId === bundle.sourceId);
-
-      // Find all installations that match this bundle's identity
-      const oldInstallations = candidateBundles.filter((installed) => {
-        const installedSourceType = (installed.sourceType as SourceType) || 'github';
-
-        return VersionManager.isSameBundleIdentity(
-          installed.bundleId,
-          installedSourceType,
-          bundle.id,
-          sourceType
-        ) && installed.version !== bundle.version;
-      });
-
-      // Remove old versions
-      for (const oldInstall of oldInstallations) {
-        this.logger.debug(`Removing old version ${oldInstall.version} of bundle ${baseIdentity}`);
-        await this.storage.removeInstallation(oldInstall.bundleId, scope);
-      }
-
-      if (oldInstallations.length > 0) {
-        this.logger.info(`Cleaned up ${oldInstallations.length} old version(s) of bundle ${baseIdentity}`);
-      }
-    } catch (error) {
-      // Log but don't fail if cleanup fails - the new version is already installed
-      this.logger.warn(`Failed to cleanup old versions: ${(error as Error).message}`);
-    }
-  }
-
-  /**
-   * Check existing installation and determine if installation should proceed
-   * Returns modified options if version change is detected
-   * @param bundleId
-   * @param bundle
-   * @param options
-   */
-  private async checkExistingInstallation(
-    bundleId: string,
-    bundle: Bundle,
-    options: InstallOptions
-  ): Promise<InstallOptions> {
-    const existing = await this.storage.getInstalledBundle(bundleId, options.scope);
-
-    if (!existing || options.force) {
-      return options;
-    }
-
-    // If a different version is being installed, allow it (treat as version change)
-    if (existing.version !== bundle.version) {
-      this.logger.info(`Version change detected: ${existing.version} → ${bundle.version}`);
-      return { ...options, force: true };
-    }
-
-    throw new Error(`Bundle '${bundleId}' is already installed. Use force=true to reinstall.`);
-  }
-
-  /**
-   * Resolve the bundle to install, handling version-specific requests
-   * @param bundleId
-   * @param options
-   */
-  private async resolveInstallationBundle(
-    bundleId: string,
-    options: InstallOptions
-  ): Promise<Bundle> {
-    // Try exact versioned bundle first if applicable
-    if (options.version && BundleIdentityMatcher.hasVersionSuffix(bundleId)) {
-      const exactBundle = await this.tryGetExactVersionedBundle(bundleId, options.version);
-      if (exactBundle) {
-        return exactBundle;
-      }
-    }
-
-    // Fall back to identity-based search
-    return await this.resolveByIdentity(bundleId, options);
-  }
-
-  /**
-   * Try to get an exact versioned bundle
-   * Returns null if not found or version doesn't match
-   * @param bundleId
-   * @param version
-   */
-  private async tryGetExactVersionedBundle(bundleId: string, version: string): Promise<Bundle | null> {
-    try {
-      const bundle = await this.getBundleDetails(bundleId);
-      if (bundle.version === version) {
-        return bundle;
-      }
-      this.logger.debug(`Bundle ${bundleId} found but version mismatch: ${bundle.version} !== ${version}`);
-      return null;
-    } catch {
-      this.logger.debug(`Exact bundle ${bundleId} not found, trying identity-based search`);
-      return null;
-    }
-  }
-
-  /**
-   * Resolve bundle by identity, applying version override if needed
-   * @param bundleId
-   * @param options
-   */
-  private async resolveByIdentity(bundleId: string, options: InstallOptions): Promise<Bundle> {
-    const searchId = await this.determineSearchId(bundleId, options);
-    let bundle = await this.getBundleDetails(searchId);
-
-    if (options.version) {
-      bundle = await this.applyVersionOverride(bundle, bundleId, options.version);
-    }
-
-    return bundle;
-  }
-
-  /**
-   * Determine the search ID for bundle lookup
-   * @param bundleId
-   * @param options
-   */
-  private async determineSearchId(bundleId: string, options: InstallOptions): Promise<string> {
-    if (!options.version) {
-      return bundleId;
-    }
-
-    // For version-specific requests, try to extract identity
-    const sources = await this.storage.getSources();
-    for (const source of sources) {
-      const cachedBundles = await this.storage.getCachedSourceBundles(source.id);
-      const matchingBundle = cachedBundles.find((b) => b.id === bundleId);
-      if (matchingBundle) {
-        return VersionManager.extractBundleIdentity(bundleId, source.type);
-      }
-    }
-
-    return bundleId;
-  }
-
-  /**
-   * Apply version override to bundle
-   * @param bundle
-   * @param originalBundleId
-   * @param requestedVersion
-   */
-  private async applyVersionOverride(
-    bundle: Bundle,
-    originalBundleId: string,
-    requestedVersion: string
-  ): Promise<Bundle> {
-    const sources = await this.storage.getSources();
-    const source = sources.find((s) => s.id === bundle.sourceId);
-
-    if (!source) {
-      this.logger.warn('Source not found for version override, using latest');
-      return bundle;
-    }
-
-    const identity = VersionManager.extractBundleIdentity(originalBundleId, source.type);
-    const specificVersion = this.versionConsolidator.getBundleVersion(identity, requestedVersion);
-
-    if (specificVersion) {
-      this.logger.info(`Installing specific version ${requestedVersion} instead of latest ${bundle.version}`);
-      // Use the original bundle ID from the version cache to preserve the correct format
-      // (e.g., owner-repo-v1.0.0 instead of owner-repo-1.0.0)
-      return {
-        ...bundle,
-        id: specificVersion.bundleId,
-        version: specificVersion.version,
-        downloadUrl: specificVersion.downloadUrl,
-        manifestUrl: specificVersion.manifestUrl,
-        lastUpdated: specificVersion.publishedAt
-      };
-    }
-
-    this.logger.warn(`Requested version ${requestedVersion} not found, using latest ${bundle.version}`);
-    return bundle;
-  }
-
-  /**
-   * Get source for a bundle
-   * @param bundle
-   */
-  private async getSourceForBundle(bundle: Bundle): Promise<RegistrySource> {
-    const sources = await this.storage.getSources();
-    const source = sources.find((s) => s.id === bundle.sourceId);
-
-    if (!source) {
-      throw new Error(`Source '${bundle.sourceId}' not found`);
-    }
-
-    return source;
-  }
-
-  /**
-   * Download and install a bundle
-   * @param bundle
-   * @param source
-   * @param options
-   */
-  private async downloadAndInstall(
-    bundle: Bundle,
-    source: RegistrySource,
-    options: InstallOptions
-  ): Promise<InstalledBundle> {
-    const adapter = this.getAdapter(source);
-
-    // For local-skills, use symlink installation instead of copying
-    if (source.type === 'local-skills') {
-      this.logger.debug(`Installing local skill as symlink from ${source.type} adapter`);
-      const localSkillsAdapter = adapter as any;
-
-      if (typeof localSkillsAdapter.getSkillSourcePath === 'function'
-        && typeof localSkillsAdapter.getSkillName === 'function') {
-        const skillSourcePath = localSkillsAdapter.getSkillSourcePath(bundle);
-        const skillName = localSkillsAdapter.getSkillName(bundle);
-
-        const localSkillSymlink = await this.installer.installLocalSkillAsSymlink(
-          bundle,
-          skillName,
-          skillSourcePath,
-          options
-        );
-
-        // Ensure sourceId and sourceType are set
-        localSkillSymlink.sourceId = bundle.sourceId;
-        localSkillSymlink.sourceType = source.type;
-
-        if (options.profileId) {
-          localSkillSymlink.profileId = options.profileId;
-        }
-
-        return localSkillSymlink;
-      }
-      // Fall through to standard installation if methods not available
-      this.logger.warn(`LocalSkillsAdapter missing symlink methods, falling back to standard installation`);
-    }
-
-    // Unified download path: all adapters use downloadBundle()
-    this.logger.debug(`Downloading bundle from ${source.type} adapter`);
-    const bundleBuffer = await adapter.downloadBundle(bundle);
-    this.logger.debug(`Bundle downloaded: ${bundleBuffer.length} bytes`);
-
-    // Install from buffer
-    const installation: InstalledBundle = await this.installer.installFromBuffer(bundle, bundleBuffer, options, source.type);
-
-    // Add profileId if provided
-    if (options.profileId) {
-      installation.profileId = options.profileId;
-    }
-
-    // Ensure sourceId and sourceType are set for identity matching
-    installation.sourceId = bundle.sourceId;
-    installation.sourceType = source.type;
-
-    return installation;
-  }
-
-  /**
    * Check for local modifications and handle user response before updating
    *
    * For repository-scoped bundles, this method:
@@ -828,213 +544,7 @@ export class RegistryManager {
     }
   }
 
-  /**
-   * Validate and normalize profile ID
-   * @param profileId
-   */
-  private validateProfileId(profileId: any): string {
-    if (typeof profileId !== 'string') {
-      const profileObj = profileId;
-      if (profileObj && typeof profileObj === 'object' && profileObj.id) {
-        this.logger.warn('Profile object passed to activateProfile, extracting ID');
-        return profileObj.id;
-      }
-      throw new Error(`Invalid profile identifier: expected string, got ${typeof profileId}`);
-    }
-    return profileId;
-  }
-
-  /**
-   * Deactivate all active profiles except the target
-   * @param targetProfileId
-   * @param progress
-   */
-  private async deactivateOtherProfiles(targetProfileId: string, progress: vscode.Progress<any>): Promise<void> {
-    const profiles = await this.storage.getProfiles();
-    progress.report({ message: 'Checking for active profiles...' });
-
-    for (const profile of profiles) {
-      if (profile.active && profile.id !== targetProfileId) {
-        this.logger.info(`Deactivating previous profile: ${profile.id}`);
-        try {
-          await this.deactivateProfile(profile.id);
-        } catch (error) {
-          this.logger.error(`Failed to deactivate profile ${profile.id}`, error as Error);
-        }
-      }
-    }
-  }
-
-  /**
-   * Get profile by ID or throw error
-   * @param profileId
-   */
-  private async getProfileById(profileId: string): Promise<Profile> {
-    const profiles = await this.storage.getProfiles();
-    const profile = profiles.find((p) => p.id === profileId);
-
-    if (!profile) {
-      throw new Error(`Profile not found: ${profileId}`);
-    }
-
-    return profile;
-  }
-
-  /**
-   * Install all bundles associated with a profile
-   * @param profile
-   * @param profileId
-   * @param progress
-   */
-  private async installProfileBundles(
-    profile: Profile,
-    profileId: string,
-    progress: vscode.Progress<any>
-  ): Promise<void> {
-    if (!profile.bundles || profile.bundles.length === 0) {
-      return;
-    }
-
-    progress.report({ message: `Installing ${profile.bundles.length} bundle(s)...` });
-    this.logger.info(`Installing ${profile.bundles.length} bundles for profile '${profileId}'`);
-
-    const allSources = await this.storage.getSources();
-    const installed: InstalledBundle[] = [];
-    const CONCURRENCY_LIMIT = CONCURRENCY_CONSTANTS.REGISTRY_BATCH_LIMIT;
-
-    for (let i = 0; i < profile.bundles.length; i += CONCURRENCY_LIMIT) {
-      const chunk = profile.bundles.slice(i, i + CONCURRENCY_LIMIT);
-
-      const results = await Promise.all(chunk.map(async (bundleRef) => {
-        progress.report({ message: `Installing ${bundleRef.id}...` });
-        try {
-          return await this.installProfileBundle(bundleRef, profileId, allSources, true);
-        } catch (error) {
-          this.logger.error(`Failed to install bundle ${bundleRef.id}`, error as Error);
-          return null;
-        }
-      }));
-
-      for (const result of results) {
-        if (result) {
-          installed.push(result);
-        }
-      }
-    }
-
-    if (installed.length > 0) {
-      this._onBundlesInstalled.fire(installed);
-    }
-
-    this.logger.info(`Profile bundle installation complete: ${installed.length} installed`);
-  }
-
-  /**
-   * Install a single bundle for a profile
-   * @param bundleRef
-   * @param profileId
-   * @param allSources
-   * @param silent
-   */
-  private async installProfileBundle(
-    bundleRef: ProfileBundle,
-    profileId: string,
-    allSources: RegistrySource[],
-    silent = false
-  ): Promise<InstalledBundle | null> {
-    // Check if bundle is already installed
-    const installedBundles = await this.storage.getInstalledBundles();
-    const alreadyInstalled = installedBundles.find((b) => b.bundleId === bundleRef.id);
-
-    if (alreadyInstalled) {
-      this.logger.info(`Bundle ${bundleRef.id} already installed, skipping`);
-      return null;
-    }
-
-    // Search for the bundle
-    this.logger.info(`Searching for bundle: ${bundleRef.id} v${bundleRef.version}`);
-    const queryBySourceAndBundleId = { text: bundleRef.id, tags: [], sourceId: bundleRef.sourceId };
-    const searchResults = await this.searchBundles(queryBySourceAndBundleId);
-    this.logger.info(`Found ${searchResults.length} matching bundles.`, searchResults);
-
-    // Find matching bundle
-    const matchingBundle = searchResults.find((b) => {
-      const idMatch = b.id === bundleRef.id || b.name.toLowerCase().includes(bundleRef.id.toLowerCase());
-      if (bundleRef.sourceId) {
-        return idMatch && b.sourceId === bundleRef.sourceId;
-      }
-      return idMatch;
-    });
-
-    if (!matchingBundle) {
-      this.logger.warn(`Bundle not found: ${bundleRef.id}`);
-      return null;
-    }
-
-    // Get source and adapter
-    const source = allSources.find((s) => s.id === matchingBundle.sourceId);
-    if (!source) {
-      this.logger.warn(`Source not found for bundle: ${matchingBundle.sourceId}`);
-      return null;
-    }
-
-    const adapter = this.getAdapter(source);
-
-    // Download and install
-    this.logger.info(`Installing bundle: ${matchingBundle.id} from source ${matchingBundle.sourceId}`);
-    this.logger.debug(`Downloading bundle from ${source.type} adapter`);
-
-    const bundleBuffer = await adapter.downloadBundle(matchingBundle);
-    this.logger.debug(`Bundle downloaded: ${bundleBuffer.length} bytes`);
-
-    const options: InstallOptions = {
-      scope: 'user',
-      force: false,
-      profileId: profileId
-    };
-
-    const installation: InstalledBundle = await this.installer.installFromBuffer(matchingBundle, bundleBuffer, options, source.type);
-
-    // Ensure sourceId and sourceType are set for identity matching
-    installation.sourceId = matchingBundle.sourceId;
-    installation.sourceType = source.type;
-
-    // Record installation and fire event
-    await this.storage.recordInstallation(installation);
-
-    if (!silent) {
-      this._onBundleInstalled.fire(installation);
-    }
-
-    this.logger.info(`Successfully installed: ${matchingBundle.id}`);
-
-    return installation;
-  }
   // ===== Helper Methods =====
-
-  /**
-   * Sort bundles by criteria
-   * @param bundles
-   * @param sortBy
-   */
-  private sortBundles(bundles: Bundle[], sortBy: string): Bundle[] {
-    switch (sortBy) {
-      case 'downloads': {
-        return bundles.toSorted((a, b) => (b.downloads || 0) - (a.downloads || 0));
-      }
-      case 'rating': {
-        return bundles.toSorted((a, b) => (b.rating || 0) - (a.rating || 0));
-      }
-      case 'recent': {
-        return bundles.toSorted((a, b) =>
-          new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime()
-        );
-      }
-      default: {
-        return bundles;
-      }
-    }
-  }
 
   /**
    * Get source type for a source ID
@@ -1052,6 +562,78 @@ export class RegistryManager {
    */
   private getSourceById(sourceId: string): RegistrySource | undefined {
     return this.sourcesCache.find((s) => s.id === sourceId);
+  }
+
+  /**
+   * Forward a generic `@ai-primitives-hub/app` log event to this
+   * extension's `Logger`. Shared by thin delegators to `app`'s registry
+   * orchestration functions (e.g. `checkUpdates`).
+   * @param event
+   */
+  private forwardLogEvent(event: LogEvent): void {
+    switch (event.level) {
+      case 'debug': {
+        this.logger.debug(event.message, event.error);
+        break;
+      }
+      case 'info': {
+        this.logger.info(event.message);
+        break;
+      }
+      case 'warn': {
+        this.logger.warn(event.message, event.error);
+        break;
+      }
+      case 'error': {
+        this.logger.error(event.message, event.error);
+        break;
+      }
+    }
+  }
+
+  /**
+   * Read/write access to local profile storage, shared by every thin
+   * profile-CRUD delegator in the "Profile Management" section below.
+   */
+  private profileStorePorts() {
+    return {
+      getProfiles: () => this.storage.getProfiles(),
+      addProfile: (profile: Profile) => this.storage.addProfile(profile),
+      updateProfile: (profileId: string, updates: Partial<Profile>) => this.storage.updateProfile(profileId, updates),
+      removeProfile: (profileId: string) => this.storage.removeProfile(profileId)
+    };
+  }
+
+  /**
+   * Read/write access needed by `exportSettings`/`importSettings`.
+   */
+  private settingsPorts() {
+    return {
+      ...this.profileStorePorts(),
+      listSources: () => this.listSources(),
+      addSource: (source: RegistrySource) => this.addSource(source),
+      clearAll: () => this.storage.clearAll(),
+      getConfiguration: (): { autoCheckUpdates?: boolean; installationScope?: string; enableLogging?: boolean } => {
+        const config = vscode.workspace.getConfiguration('promptregistry');
+        return {
+          autoCheckUpdates: config.get<boolean>('autoCheckUpdates'),
+          installationScope: config.get<string>('installationScope'),
+          enableLogging: config.get<boolean>('enableLogging')
+        };
+      },
+      updateConfiguration: async (updates: { autoCheckUpdates?: boolean; installationScope?: string; enableLogging?: boolean }) => {
+        const config = vscode.workspace.getConfiguration('promptregistry');
+        if (updates.autoCheckUpdates !== undefined) {
+          await config.update('autoCheckUpdates', updates.autoCheckUpdates, true);
+        }
+        if (updates.installationScope !== undefined) {
+          await config.update('installationScope', updates.installationScope, true);
+        }
+        if (updates.enableLogging !== undefined) {
+          await config.update('enableLogging', updates.enableLogging, true);
+        }
+      }
+    };
   }
 
   /**
@@ -1208,7 +790,7 @@ export class RegistryManager {
    */
   public clearAdapterCache(sourceId: string): void {
     const adapter = this.adapters.get(sourceId);
-    if (adapter && adapter instanceof GitHubAdapter) {
+    if (adapter && adapter instanceof InfraGitHubAdapter) {
       adapter.clearManifestCache();
       this.logger.debug(`Cleared manifest cache for source: ${sourceId}`);
     }
@@ -1225,7 +807,7 @@ export class RegistryManager {
 
     // Validate source (with global token if applicable)
     const enrichedSource = this.enrichSourceWithGlobalToken(source);
-    const adapter = RepositoryAdapterFactory.create(enrichedSource);
+    const adapter = createRegistryAdapter(enrichedSource);
     const validation = await adapter.validate();
 
     if (!validation.valid) {
@@ -1278,7 +860,7 @@ export class RegistryManager {
 
     if (updatedSource && updatedSource.enabled) {
       const enrichedSource = this.enrichSourceWithGlobalToken(updatedSource);
-      const adapter = RepositoryAdapterFactory.create(enrichedSource);
+      const adapter = createRegistryAdapter(enrichedSource);
       this.adapters.set(sourceId, adapter);
     }
 
@@ -1369,7 +951,7 @@ export class RegistryManager {
    */
   public async validateSource(source: RegistrySource): Promise<ValidationResult> {
     const enrichedSource = this.enrichSourceWithGlobalToken(source);
-    const adapter = RepositoryAdapterFactory.create(enrichedSource);
+    const adapter = createRegistryAdapter(enrichedSource);
     return await adapter.validate();
   }
 
@@ -1398,6 +980,13 @@ export class RegistryManager {
 
   /**
    * Search for bundles across all enabled sources
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `searchRegistryBundles`
+   * — this function has no reference-branch counterpart (see its own module header), so it was
+   * designed from scratch here following this migration's established
+   * `registry/*` port-orchestration pattern, porting this method's
+   * (plus the now-removed private `sortBundles` helper's) exact prior
+   * behavior.
    * @param query - Search query options
    * @param query.sourceId - Optional source ID to limit search to a specific source
    * @param query.cacheOnly - If true, only return cached bundles without fetching from network.
@@ -1405,86 +994,21 @@ export class RegistryManager {
    * @returns Promise resolving to array of matching bundles
    */
   public async searchBundles(query: SearchQuery): Promise<Bundle[]> {
-    this.logger.info('Searching bundles', query);
-
-    const sources = await this.storage.getSources();
-    const allBundles: Bundle[] = [];
-
-    // Filter sources if specified
-    const sourcesToSearch = query.sourceId
-      ? sources.filter((s) => s.id === query.sourceId)
-      : sources.filter((s) => s.enabled);
-
-    this.logger.info(`Searching in ${sourcesToSearch.length} sources`);
-
-    for (const source of sourcesToSearch) {
-      try {
-        // Try cache first
-        let bundles = await this.storage.getCachedSourceBundles(source.id);
-
-        // If cache empty and not in cacheOnly mode, fetch from source
-        if (bundles.length === 0 && !query.cacheOnly) {
-          const adapter = this.getAdapter(source);
-          bundles = await adapter.fetchBundles();
-          await this.storage.cacheSourceBundles(source.id, bundles);
-        }
-
-        allBundles.push(...bundles);
-      } catch (error) {
-        this.logger.error(`Failed to fetch bundles from source '${source.id}'`, error as Error);
-      }
-    }
-
-    // Apply version consolidation for GitHub sources
-    let results = allBundles;
-    try {
-      // Consolidate bundles (only GitHub bundles will be consolidated)
-      // Source type resolver is already configured in constructor
-      results = this.versionConsolidator.consolidateBundles(allBundles);
-      this.logger.debug(`Consolidated ${allBundles.length} bundles into ${results.length} entries`);
-    } catch (error) {
-      this.logger.error('Version consolidation failed, using unconsolidated bundles', error as Error);
-      // Fall back to unconsolidated bundles on error
-      results = allBundles;
-    }
-
-    // Apply filters
-    if (query.text) {
-      const searchText = query.text.toLowerCase();
-      results = results.filter((b) =>
-        b.id === query.text
-        || b.name.toLowerCase().includes(searchText)
-        || b.description.toLowerCase().includes(searchText)
-      );
-    }
-
-    if (query.tags && query.tags.length > 0) {
-      results = results.filter((b) =>
-        query.tags!.some((tag) => b.tags.includes(tag))
-      );
-    }
-
-    if (query.author) {
-      results = results.filter((b) => b.author === query.author);
-    }
-
-    if (query.environment) {
-      results = results.filter((b) => b.environments.includes(query.environment!));
-    }
-
-    // Sort results
-    if (query.sortBy) {
-      results = this.sortBundles(results, query.sortBy);
-    }
-
-    // Apply pagination
-    if (query.offset !== undefined || query.limit !== undefined) {
-      const offset = query.offset || 0;
-      const limit = query.limit || 50;
-      results = results.slice(offset, offset + limit);
-    }
-
-    return results;
+    // Unlike installBundle/updateBundle, no `as X` cast is needed here:
+    // core's Bundle has no loose nested fields (cf. InstalledBundle's
+    // mcpServers) — it's structurally identical to this extension's own
+    // Bundle type outright.
+    return searchRegistryBundles(
+      query,
+      {
+        listSources: () => this.storage.getSources(),
+        getCachedSourceBundles: (sourceId) => this.storage.getCachedSourceBundles(sourceId),
+        cacheSourceBundles: (sourceId, bundles) => this.storage.cacheSourceBundles(sourceId, bundles),
+        getAdapter: (source) => this.getAdapter(source),
+        consolidateBundles: (bundles) => this.versionConsolidator.consolidateBundles(bundles)
+      },
+      (event) => this.forwardLogEvent(event)
+    );
   }
 
   /**
@@ -1546,36 +1070,35 @@ export class RegistryManager {
    * @param silent
    */
   public async installBundle(bundleId: string, options: InstallOptions, silent = false): Promise<InstalledBundle> {
-    this.logger.info(`Installing bundle: ${bundleId}`, options);
-
-    // Resolve the bundle to install (handles version-specific requests)
-    const bundle = await this.resolveInstallationBundle(bundleId, options);
-
-    // Check existing installation and determine if we should proceed
-    const installOptions = await this.checkExistingInstallation(bundleId, bundle, options);
-
-    // Get source
-    const source = await this.getSourceForBundle(bundle);
-
-    // Download and install
-    const installation = await this.downloadAndInstall(bundle, source, installOptions);
-
-    // Record installation FIRST (before cleanup) to ensure metadata is safe
-    // If anything fails here, old versions remain and can be used as fallback
-    // Note: Repository scope bundles are tracked via LockfileManager, not RegistryStorage
-    // The lockfile is already updated by BundleInstaller during installation
-    if (options.scope !== 'repository') {
-      await this.storage.recordInstallation(installation);
-    }
-
-    // Clean up old versions AFTER successful recording
-    // This ensures we don't lose the old version if recording fails
-    await this.cleanupOldVersions(bundle, options.scope);
+    // See uninstallBundle's identical, documented `as InstalledBundle` cast:
+    // core's DeploymentManifest.mcpServers is intentionally looser than this
+    // extension's McpServersManifest; the data itself is always this
+    // extension's own shape here too, since it only ever flows from
+    // RegistryStorage/BundleInstaller below.
+    const installation = await installRegistryBundle(
+      bundleId,
+      options,
+      {
+        getBundleDetails: (id) => this.getBundleDetails(id),
+        listSources: () => this.storage.getSources(),
+        getCachedSourceBundles: (sourceId) => this.storage.getCachedSourceBundles(sourceId),
+        getBundleVersion: (identity, version) => this.versionConsolidator.getBundleVersion(identity, version),
+        getInstalledBundle: (id, scope) => this.storage.getInstalledBundle(id, scope),
+        getAdapter: (source) => this.getAdapter(source),
+        installFromBuffer: (bundle, buffer, installOptions, sourceType) =>
+          this.installer.installFromBuffer(bundle, buffer, installOptions, sourceType),
+        installLocalSkillAsSymlink: (bundle, skillName, sourcePath, installOptions) =>
+          this.installer.installLocalSkillAsSymlink(bundle, skillName, sourcePath, installOptions),
+        recordInstallation: (installedBundle) => this.storage.recordInstallation(installedBundle as InstalledBundle),
+        getInstalledBundles: (scope) => this.storage.getInstalledBundles(scope),
+        removeInstallation: (id, scope) => this.storage.removeInstallation(id, scope)
+      },
+      (event) => this.forwardLogEvent(event)
+    ) as InstalledBundle;
 
     if (!silent) {
       this._onBundleInstalled.fire(installation);
     }
-    this.logger.info(`Bundle '${bundleId}' installed successfully`);
 
     return installation;
   }
@@ -1617,64 +1140,43 @@ export class RegistryManager {
 
   /**
    * Uninstall a bundle
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `uninstallInstalledBundle`
    * @param bundleId
    * @param scope
    * @param silent
    */
   public async uninstallBundle(bundleId: string, scope: InstallationScope = 'user', silent = false): Promise<void> {
-    this.logger.info(`Uninstalling bundle: ${bundleId}`);
-
-    // Get installation record - repository scope uses LockfileManager
-    let installed: InstalledBundle | undefined;
-
-    if (scope === 'repository') {
-      const workspaceRoot = getWorkspaceRoot();
-      if (!workspaceRoot) {
-        throw new Error('Cannot uninstall repository-scoped bundle: no workspace is open');
-      }
-
-      const lockfileManager = LockfileManager.getInstance(workspaceRoot);
-
-      // Use getInstalledBundles() to search both main and local lockfiles
-      const installedBundles = await lockfileManager.getInstalledBundles();
-      installed = installedBundles.find((b) => b.bundleId === bundleId);
-    } else {
-      installed = await this.storage.getInstalledBundle(bundleId, scope);
-    }
-
-    if (!installed) {
-      throw new Error(`Bundle '${bundleId}' is not installed in ${scope} scope`);
-    }
-
-    // Get source information for post-uninstall hooks
-    let source: RegistrySource | undefined;
-    const installedSourceId = installed.sourceId;
-    if (installedSourceId) {
-      const sources = await this.storage.getSources();
-      source = sources.find((s) => s.id === installedSourceId);
-    }
-
-    // For local-skills, use symlink uninstallation (removes symlink, not source directory)
-    if (installed.sourceType === 'local-skills' || source?.type === 'local-skills') {
-      this.logger.debug(`Uninstalling local skill symlink: ${bundleId}`);
-      await this.installer.uninstallSkillSymlink(installed);
-    } else {
-      // Uninstall using BundleInstaller
-      await this.installer.uninstall(installed);
-    }
-
-    // Remove installation record using the stored bundle ID from the installation record
-    // This ensures we remove the correct record even for versioned bundles
-    // Note: For repository scope, the lockfile is updated by BundleInstaller.uninstall()
-    // Repository scope bundles are tracked via LockfileManager, not RegistryStorage
-    if (scope !== 'repository') {
-      await this.storage.removeInstallation(installed.bundleId, scope);
-    }
+    const installed = await uninstallInstalledBundle(
+      bundleId,
+      scope,
+      {
+        getInstalledBundle: (id, s) => this.storage.getInstalledBundle(id, s),
+        getRepositoryInstalledBundles: async () => {
+          const workspaceRoot = getWorkspaceRoot();
+          if (!workspaceRoot) {
+            throw new Error('Cannot uninstall repository-scoped bundle: no workspace is open');
+          }
+          // Use getInstalledBundles() to search both main and local lockfiles
+          const lockfileManager = LockfileManager.getInstance(workspaceRoot);
+          return lockfileManager.getInstalledBundles();
+        },
+        listSources: () => this.storage.getSources(),
+        // `core`'s `DeploymentManifest.mcpServers` is intentionally looser
+        // (`Record<string, unknown>`) than this extension's `McpServersManifest`
+        // (see `listInstalledBundles`'s identical, already-documented cast above) —
+        // the data itself is always this extension's own shape here too, since it
+        // only ever flows from `RegistryStorage`/`LockfileManager` above.
+        uninstall: (installedBundle) => this.installer.uninstall(installedBundle as InstalledBundle),
+        uninstallSkillSymlink: (installedBundle) => this.installer.uninstallSkillSymlink(installedBundle as InstalledBundle),
+        removeInstallation: (id, s) => this.storage.removeInstallation(id, s)
+      },
+      (event) => this.forwardLogEvent(event)
+    );
 
     if (!silent) {
       this._onBundleUninstalled.fire(installed.bundleId);
     }
-    this.logger.info(`Bundle '${installed.bundleId}' uninstalled successfully`);
   }
 
   /**
@@ -1720,111 +1222,36 @@ export class RegistryManager {
    * @param version
    */
   public async updateBundle(bundleId: string, version?: string): Promise<void> {
-    this.logger.info(`Updating bundle: ${bundleId} to version: ${version || 'latest'}`);
-
-    // Get current installation - use listInstalledBundles to include repository-scoped bundles
-    const allInstalled = await this.listInstalledBundles();
-    const current = allInstalled.find((b) => b.bundleId === bundleId);
-
-    if (!current) {
-      throw new Error(`Bundle '${bundleId}' is not installed`);
-    }
-
-    // For repository-scoped bundles, check for local modifications before updating
-    // Requirements: 14.1-14.10
-    await this.checkLocalModificationsBeforeUpdate(bundleId, current);
-
-    // Get new bundle details
-    // Extract identity for GitHub bundles to find the latest version
-    const identity = current.sourceType === 'github'
-      ? VersionManager.extractBundleIdentity(bundleId, 'github')
-      : bundleId.replace(/-v?\d+\.\d+\.\d+(-[\w.]+)?$/, '');
-
-    let bundle: Bundle;
-    if (version) {
-      // Search for the specific version
-      const versionedId = `${identity}-${version}`;
-
-      try {
-        bundle = await this.getBundleDetails(versionedId);
-      } catch {
-        // If versioned ID not found, try the identity
-        this.logger.warn(`Bundle '${versionedId}' not found, trying identity '${identity}'`);
-        bundle = await this.getBundleDetails(identity);
-        // Verify the version matches
-        if (bundle.version !== version) {
-          throw new Error(`Requested version ${version} not found for bundle '${identity}'`);
-        }
-      }
-    } else {
-      // Try to get bundle by identity first (for GitHub bundles with versions)
-      try {
-        bundle = await this.getBundleDetails(identity);
-        this.logger.debug(`Found bundle by identity: ${identity} -> ${bundle.id} v${bundle.version}`);
-      } catch {
-        // Fall back to exact bundleId if identity lookup fails
-        this.logger.debug(`Identity lookup failed for '${identity}', trying exact bundleId '${bundleId}'`);
-        bundle = await this.getBundleDetails(bundleId);
-      }
-    }
-
-    // Check if update is needed
-    if (current.version === bundle.version) {
-      this.logger.info(`Bundle '${bundleId}' is already at version ${bundle.version}, reinstalling...`);
-      // Continue with reinstall instead of returning early
-    }
-
-    // Get source and adapter
-    const sources = await this.storage.getSources();
-    const source = sources.find((s) => s.id === bundle.sourceId);
-
-    if (!source) {
-      throw new Error(`Source '${bundle.sourceId}' not found`);
-    }
-
-    const adapter = this.getAdapter(source);
-
-    // Unified download path: use downloadBundle() for all sources
-    this.logger.debug(`Downloading bundle update from ${source.type} adapter`);
-    const bundleBuffer = await adapter.downloadBundle(bundle);
-    this.logger.debug(`Bundle downloaded: ${bundleBuffer.length} bytes`);
-
-    // Update using BundleInstaller
-    const updated = await this.installer.update(
-      current,
-      bundle,
-      bundleBuffer,
-      source.type
-    );
-
-    // CRITICAL: Write new installation record first, then remove old record
-    // This ordering ensures crash-safety - if removal fails, we have the new record
-    // If write fails, the old record remains intact
-    // Note: Repository scope bundles are tracked via LockfileManager, not RegistryStorage
-    // The lockfile is already updated by BundleInstaller during update
-    this.logger.debug(`Recording new installation for '${updated.bundleId}' v${updated.version}`);
-    if (current.scope !== 'repository') {
-      await this.storage.recordInstallation(updated);
-    }
-
-    // Only remove old record if bundleId changed (e.g., GitHub bundles with version in ID)
-    // For Awesome Copilot bundles, the bundleId doesn't include version, so old and new are the same
-    // In that case, recordInstallation already overwrote the old record
-    if (updated.bundleId !== bundleId && current.scope !== 'repository') {
-      this.logger.debug(`Removing old installation record for '${bundleId}' from ${current.scope} scope`);
-      await this.storage.removeInstallation(bundleId, current.scope);
-    } else {
-      this.logger.debug(`BundleId unchanged ('${bundleId}'), old record already overwritten`);
-    }
+    // See installBundle's identical, documented `as InstalledBundle` cast:
+    // core's DeploymentManifest.mcpServers is intentionally looser than this
+    // extension's McpServersManifest; the data itself is always this
+    // extension's own shape here too, since it only ever flows from
+    // RegistryStorage/BundleInstaller below.
+    const updated = await updateRegistryBundle(
+      bundleId,
+      version,
+      {
+        listInstalledBundles: () => this.listInstalledBundles(),
+        checkLocalModifications: (id, current) => this.checkLocalModificationsBeforeUpdate(id, current as InstalledBundle),
+        getBundleDetails: (id) => this.getBundleDetails(id),
+        listSources: () => this.storage.getSources(),
+        getAdapter: (source) => this.getAdapter(source),
+        updateInstalledBundle: (current, bundle, buffer, sourceType) =>
+          this.installer.update(current as InstalledBundle, bundle, buffer, sourceType),
+        recordInstallation: (installation) => this.storage.recordInstallation(installation as InstalledBundle),
+        removeInstallation: (id, scope) => this.storage.removeInstallation(id, scope)
+      },
+      (event) => this.forwardLogEvent(event)
+    ) as InstalledBundle;
 
     this._onBundleUpdated.fire(updated);
-    this.logger.info(`Bundle '${bundleId}' updated from v${current.version} to v${bundle.version}`);
   }
 
   /**
    * List installed bundles
    *
-   * Queries the appropriate source based on scope:
+   * Thin delegator to `@ai-primitives-hub/app`'s `listInstalledBundles`
+   * — queries the appropriate source based on scope:
    * - 'repository': Query LockfileManager only
    * - 'user' or 'workspace': Query RegistryStorage only
    * - undefined (no scope): Combine results from both sources
@@ -1835,80 +1262,46 @@ export class RegistryManager {
    * @param scope
    */
   public async listInstalledBundles(scope?: InstallationScope): Promise<InstalledBundle[]> {
-    const bundles: InstalledBundle[] = [];
-
-    // Query user/workspace bundles from RegistryStorage
-    if (scope !== 'repository') {
-      const storageBundles = await this.storage.getInstalledBundles(scope);
-      bundles.push(...storageBundles);
-    }
-
-    // Query repository bundles from LockfileManager
-    if (scope === 'repository' || scope === undefined) {
-      const workspaceRoot = getWorkspaceRoot();
-      if (workspaceRoot) {
+    const bundles = await listInstalledBundlesCore(scope, {
+      getInstalledBundles: (s) => this.storage.getInstalledBundles(s),
+      getRepositoryInstalledBundles: async () => {
+        const workspaceRoot = getWorkspaceRoot();
+        if (!workspaceRoot) {
+          return [];
+        }
         try {
           const lockfileManager = LockfileManager.getInstance(workspaceRoot);
-          const repoBundles = await lockfileManager.getInstalledBundles();
-          bundles.push(...repoBundles);
+          return await lockfileManager.getInstalledBundles();
         } catch (error) {
           this.logger.warn('Failed to query repository bundles from lockfile:', error instanceof Error ? error : undefined);
-          // Continue without repository bundles on error
+          return [];
         }
       }
-    }
-
-    return bundles;
+    });
+    // `core`'s `DeploymentManifest.mcpServers` is intentionally looser
+    // (`Record<string, unknown>`) than this extension's `McpServersManifest`
+    // pending a dedicated `domain/mcp` module (see that field's JSDoc in
+    // `packages/core/src/domain/collection/types.ts`) — the data itself is
+    // always this extension's own shape, since it only ever flows through
+    // `RegistryStorage`/`LockfileManager` above and back out.
+    return bundles as InstalledBundle[];
   }
 
   /**
    * Check for bundle updates
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `detectBundleUpdates`
    */
   public async checkUpdates(): Promise<BundleUpdate[]> {
-    this.logger.info('Checking for bundle updates');
-
-    const installed = await this.storage.getInstalledBundles();
-    const updates: BundleUpdate[] = [];
-
-    for (const bundle of installed) {
-      try {
-        // Try to get bundle details, handling versioned IDs that may not exist in consolidated list
-        let latest: Bundle;
-        try {
-          latest = await this.getBundleDetails(bundle.bundleId);
-        } catch (error) {
-          // If versioned ID not found, try extracting identity for GitHub bundles
-          const sources = await this.storage.getSources();
-          // Try both scopes to find the installed bundle
-          let installedBundle = await this.storage.getInstalledBundle(bundle.bundleId, 'user');
-          if (!installedBundle) {
-            installedBundle = await this.storage.getInstalledBundle(bundle.bundleId, 'workspace');
-          }
-          const source = sources.find((s) => s.id === installedBundle?.sourceId);
-
-          if (source?.type === 'github') {
-            const identity = VersionManager.extractBundleIdentity(bundle.bundleId, 'github');
-            this.logger.debug(`Versioned bundle '${bundle.bundleId}' not found, trying identity '${identity}'`);
-            latest = await this.getBundleDetails(identity);
-          } else {
-            throw error; // Re-throw if not a GitHub bundle
-          }
-        }
-
-        if (latest.version !== bundle.version) {
-          updates.push({
-            bundleId: bundle.bundleId,
-            currentVersion: bundle.version,
-            latestVersion: latest.version
-          });
-        }
-      } catch (error) {
-        this.logger.error(`Failed to check update for '${bundle.bundleId}'`, error as Error);
-      }
-    }
-
-    this.logger.info(`Found ${updates.length} bundle updates`);
-    return updates;
+    return detectBundleUpdates(
+      {
+        getInstalledBundles: (scope) => this.storage.getInstalledBundles(scope),
+        getBundleDetails: (bundleId) => this.getBundleDetails(bundleId),
+        listSources: () => this.storage.getSources(),
+        getInstalledBundle: (bundleId, scope) => this.storage.getInstalledBundle(bundleId, scope)
+      },
+      (event) => this.forwardLogEvent(event)
+    );
   }
 
   /**
@@ -1961,115 +1354,84 @@ export class RegistryManager {
 
   /**
    * Create a profile
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `createLocalProfile`
    * @param profile
    */
   public async createProfile(profile: Omit<Profile, 'createdAt' | 'updatedAt'>): Promise<Profile> {
-    this.logger.info(`Creating profile: ${profile.name}`);
+    const fullProfile = await createLocalProfile(this.profileStorePorts(), profile);
 
-    const fullProfile: Profile = {
-      ...profile,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    await this.storage.addProfile(fullProfile);
     this._onProfileCreated.fire(fullProfile);
-    this.logger.info(`Profile '${profile.name}' created successfully`);
 
     return fullProfile;
   }
 
   /**
    * Update a profile
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `updateLocalProfile`.
    * @param profileId
    * @param updates
    */
   public async updateProfile(profileId: string, updates: Partial<Profile>): Promise<void> {
-    this.logger.info(`Updating profile: ${profileId}`);
+    const updatedProfile = await updateLocalProfile(this.profileStorePorts(), profileId, updates);
 
-    await this.storage.updateProfile(profileId, {
-      ...updates,
-      updatedAt: new Date().toISOString()
-    });
-
-    // Get the updated profile and fire event
-    const profiles = await this.storage.getProfiles();
-    const updatedProfile = profiles.find((p) => p.id === profileId);
     if (updatedProfile) {
       this._onProfileUpdated.fire(updatedProfile);
     }
-
-    this.logger.info(`Profile '${profileId}' updated successfully`);
   }
 
   /**
    * Check if a profile is from the active hub (and thus read-only)
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `isHubProfile`.
    * @param profileId
    */
   public async isHubProfile(profileId: string): Promise<boolean> {
-    if (!this.hubManager) {
-      return false;
-    }
-
-    const hubProfiles = await this.hubManager.listActiveHubProfiles();
-    return hubProfiles.some((p) => p.id === profileId);
+    return await isAppHubProfile(this.hubManager, profileId);
   }
 
   /**
    * Delete a profile
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `deleteLocalProfile`.
    * @param profileId
    */
   public async deleteProfile(profileId: string): Promise<void> {
-    this.logger.info(`Deleting profile: ${profileId}`);
-
-    await this.storage.removeProfile(profileId);
+    await deleteLocalProfile(this.profileStorePorts(), profileId);
     this._onProfileDeleted.fire(profileId);
-
-    this.logger.info(`Profile '${profileId}' deleted successfully`);
   }
 
   /**
    * List only local profiles (from storage, excludes hub profiles)
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `listLocalProfiles`.
    */
   public async listLocalProfiles(): Promise<Profile[]> {
-    return await this.storage.getProfiles();
+    return await listLocalProfilesCore(this.profileStorePorts());
   }
 
   /**
    * List all profiles (both hub profiles and local profiles)
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `listAllProfiles`.
    */
   public async listProfiles(): Promise<Profile[]> {
-    const allProfiles: Profile[] = [];
-
-    // Get hub profiles if hub manager is available
-    if (this.hubManager) {
-      try {
-        const hubProfiles = await this.hubManager.listActiveHubProfiles();
-        // Get list of all active profiles to check activation status
-        const activeProfiles = await this.hubManager.listAllActiveProfiles();
-        const activeProfileIds = new Set(activeProfiles.map((ap) => ap.profileId));
-
-        // Convert HubProfileWithMetadata to Profile format
-        const convertedHubProfiles = hubProfiles.map((hp) => ({
-          ...hp,
-          icon: hp.icon || '📦', // Provide default icon if not defined in hub config
-          active: activeProfileIds.has(hp.id) // Check if this profile is currently active
-        }));
-        allProfiles.push(...convertedHubProfiles);
-      } catch (error) {
-        this.logger.warn('Failed to get hub profiles', error);
-      }
-    }
-
-    // Also get local profiles
-    const localProfiles = await this.storage.getProfiles();
-    allProfiles.push(...localProfiles);
-
-    return allProfiles;
+    return await listAllProfiles(
+      this.profileStorePorts(),
+      this.hubManager,
+      (event) => this.forwardLogEvent(event)
+    );
   }
 
   /**
    * Activate a profile
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `activateRegistryProfile`
+   * The original's `vscode.window.withProgress` wrapper and `progress.report` calls
+   * stay here (presentation-only VS Code glue) — `onLog` forwards
+   * `'info'`-level events to the progress notification in addition to
+   * the `Logger`, matching the original checkpoint messages.
    * @param profileId
    */
   public async activateProfile(profileId: string): Promise<void> {
@@ -2080,211 +1442,114 @@ export class RegistryManager {
     }, async (progress) => {
       progress.report({ message: 'Preparing...' });
 
-      const validatedProfileId = this.validateProfileId(profileId);
-      this.logger.info(`Activating profile: ${validatedProfileId}`);
-
-      // Deactivate ALL currently active profiles (both hub and local)
-      progress.report({ message: 'Deactivating other profiles...' });
-
-      // Deactivate all active hub profiles (and uninstall their bundles)
-      if (this.hubManager) {
-        try {
-          const activeHubProfiles = await this.hubManager.listAllActiveProfiles();
-          for (const activeProfile of activeHubProfiles) {
-            if (activeProfile.profileId !== validatedProfileId) {
-              this.logger.info(`Deactivating hub profile: ${activeProfile.profileId}`);
-              try {
-                // Call RegistryManager.deactivateProfile() instead of HubManager.deactivateProfile()
-                // This ensures bundles are uninstalled, not just flags updated
-                await this.deactivateProfile(activeProfile.profileId);
-              } catch (error) {
-                this.logger.error(`Failed to deactivate hub profile ${activeProfile.profileId}`, error as Error);
-              }
-            }
+      const result = await activateRegistryProfile(
+        {
+          getProfiles: () => this.storage.getProfiles(),
+          updateProfile: (id, updates) => this.storage.updateProfile(id, updates),
+          getSources: () => this.storage.getSources(),
+          getInstalledBundles: () => this.storage.getInstalledBundles(),
+          searchBundles: (query) => this.searchBundles(query),
+          getAdapter: (source) => this.getAdapter(source),
+          installFromBuffer: (bundle, buffer, options, sourceType) =>
+            this.installer.installFromBuffer(bundle, buffer, options, sourceType),
+          recordInstallation: (installation) => this.storage.recordInstallation(installation as InstalledBundle),
+          deactivateOther: (id) => this.deactivateProfile(id),
+          hub: this.hubManager && {
+            listActiveHubProfiles: () => this.hubManager!.listActiveHubProfiles(),
+            listAllActiveProfiles: () => this.hubManager!.listAllActiveProfiles(),
+            activateProfile: (hubId, id, options) => this.hubManager!.activateProfile(hubId, id, options),
+            deactivateProfile: (hubId, id) => this.hubManager!.deactivateProfile(hubId, id)
           }
-        } catch (error) {
-          this.logger.error('Failed to deactivate hub profiles', error as Error);
-        }
-      }
-
-      // Deactivate all active local profiles (and uninstall their bundles)
-      const profiles = await this.storage.getProfiles();
-      for (const localProfile of profiles) {
-        if (localProfile.active && localProfile.id !== validatedProfileId) {
-          this.logger.info(`Deactivating local profile: ${localProfile.id}`);
-          try {
-            // Call deactivateProfile() to properly uninstall bundles, not just update flags
-            await this.deactivateProfile(localProfile.id);
-          } catch (error) {
-            this.logger.error(`Failed to deactivate local profile ${localProfile.id}`, error as Error);
+        },
+        profileId,
+        (event) => {
+          this.forwardLogEvent(event);
+          if (event.level === 'info') {
+            progress.report({ message: event.message });
           }
         }
+      );
+
+      if (result.hubActivation) {
+        this._onProfileActivated.fire({ ...result.hubActivation.hubProfile, active: true });
+        return;
       }
 
-      // Check if this is a hub profile and delegate to HubManager
-      if (this.hubManager) {
-        const isHub = await this.isHubProfile(validatedProfileId);
-        if (isHub) {
-          this.logger.info(`Profile ${validatedProfileId} is from hub, delegating to HubManager`);
-          const hubProfiles = await this.hubManager.listActiveHubProfiles();
-          const hubProfile = hubProfiles.find((p) => p.id === validatedProfileId);
-          if (hubProfile && hubProfile.hubId) {
-            await this.hubManager.activateProfile(hubProfile.hubId, validatedProfileId, { installBundles: true });
-            // Fire event to update tree view with active status
-            this._onProfileActivated.fire({ ...hubProfile, active: true });
-            return;
-          }
+      if (result.localActivation) {
+        this._onProfileActivated.fire(result.localActivation.profile);
+        this._onProfileActivated.fire(result.localActivation.profile);
+
+        if (result.localActivation.installedBundles.length > 0) {
+          this._onBundlesInstalled.fire(result.localActivation.installedBundles as InstalledBundle[]);
         }
       }
-
-      progress.report({ message: 'Installing bundles...' });
-
-      // Get and activate the target profile
-      const profile = await this.getProfileById(validatedProfileId);
-      if (profile) {
-        this._onProfileActivated.fire(profile);
-      }
-
-      // Deactivate other active profiles
-      await this.deactivateOtherProfiles(validatedProfileId, progress);
-
-      this._onProfileActivated.fire(profile);
-
-      // Install profile bundles
-      await this.installProfileBundles(profile, validatedProfileId, progress);
-
-      // Mark profile as active
-      await this.storage.updateProfile(validatedProfileId, { active: true });
-
-      this.logger.info(`Profile '${validatedProfileId}' activated successfully`);
-      progress.report({ message: 'Profile activated successfully' });
     });
   }
 
   /**
    * Deactivate a profile and uninstall its bundles
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s
+   * `deactivateRegistryProfile`.
    * @param profileId
    */
   public async deactivateProfile(profileId: string): Promise<void> {
-    this.logger.info(`Deactivating profile: ${profileId}`);
-
-    // Check if this is a hub profile first
-    if (this.hubManager) {
-      const isHub = await this.isHubProfile(profileId);
-      if (isHub) {
-        this.logger.info(`Profile ${profileId} is from hub, delegating to HubManager`);
-        const hubProfiles = await this.hubManager.listActiveHubProfiles();
-        const hubProfile = hubProfiles.find((p) => p.id === profileId);
-        if (hubProfile && hubProfile.hubId) {
-          await this.hubManager.deactivateProfile(hubProfile.hubId, profileId);
-
-          // Uninstall only the bundles that were installed BY THIS PROFILE
-          // (not bundles installed manually or by other profiles)
-          const bundles = (await this.storage.getInstalledBundles()).filter((b) => b.profileId === profileId);
-
-          if (bundles.length > 0) {
-            this.logger.info(`Uninstalling ${bundles.length} bundles from hub profile '${profileId}'`);
-            await this.uninstallBundles(bundles.map((b) => b.bundleId));
-          }
-
-          // Fire event to update tree view
-          this._onProfileDeactivated.fire(profileId);
-          this.logger.info(`Profile deactivated: ${profileId}`);
-          return;
+    await deactivateRegistryProfile(
+      {
+        getProfiles: () => this.storage.getProfiles(),
+        updateProfile: (id, updates) => this.storage.updateProfile(id, updates),
+        getInstalledBundles: () => this.storage.getInstalledBundles(),
+        uninstallBundles: (bundleIds) => this.uninstallBundles(bundleIds),
+        hub: this.hubManager && {
+          listActiveHubProfiles: () => this.hubManager!.listActiveHubProfiles(),
+          listAllActiveProfiles: () => this.hubManager!.listAllActiveProfiles(),
+          activateProfile: (hubId, id, options) => this.hubManager!.activateProfile(hubId, id, options),
+          deactivateProfile: (hubId, id) => this.hubManager!.deactivateProfile(hubId, id)
         }
-      }
-    }
-
-    const profiles = await this.storage.getProfiles();
-    const profile = profiles.find((p) => p.id === profileId);
-
-    if (!profile) {
-      throw new Error(`Profile not found: ${profileId}`);
-    }
-
-    // Uninstall bundles associated with this profile
-    const installedBundles = await this.storage.getInstalledBundles();
-    const profileBundles = installedBundles.filter((b) => b.profileId === profileId);
-
-    this.logger.info(`Uninstalling ${profileBundles.length} bundles from profile '${profileId}'`);
-
-    await this.uninstallBundles(profileBundles.map((b) => b.bundleId));
-
-    // Mark profile as inactive
-    await this.storage.updateProfile(profileId, { active: false });
+      },
+      profileId,
+      (event) => this.forwardLogEvent(event)
+    );
 
     this._onProfileDeactivated.fire(profileId);
-    this.logger.info(`Profile '${profileId}' deactivated successfully`);
   }
 
   /**
    * Export a profile
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `exportLocalProfile`.
    * @param profileId
    */
   public async exportProfile(profileId: string): Promise<string> {
-    const profiles = await this.storage.getProfiles();
-    const profile = profiles.find((p) => p.id === profileId);
-
-    if (!profile) {
-      throw new Error(`Profile '${profileId}' not found`);
-    }
-
-    return JSON.stringify(profile, null, 2);
+    return await exportLocalProfile(this.profileStorePorts(), profileId);
   }
 
   /**
    * Import a profile
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s `importLocalProfile`.
    * @param profileData
    */
   public async importProfile(profileData: string): Promise<Profile> {
-    const profile = JSON.parse(profileData) as Profile;
-
-    // Update timestamps
-    profile.createdAt = new Date().toISOString();
-    profile.updatedAt = new Date().toISOString();
-    profile.active = false;
-
-    await this.storage.addProfile(profile);
-
-    return profile;
+    return await importLocalProfile(this.profileStorePorts(), profileData);
   }
 
   /**
    * Export complete registry settings (sources + profiles + configuration)
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s
+   * `exportRegistrySettings`.
    * @param format
    */
   public async exportSettings(format: ExportFormat = 'json'): Promise<string> {
-    const sources = await this.listSources();
-    const profiles = await this.storage.getProfiles();
-
-    const config = vscode.workspace.getConfiguration('promptregistry');
-
-    const settings: ExportedSettings = {
-      version: '1.0.0',
-      exportedAt: new Date().toISOString(),
-      sources,
-      profiles,
-      configuration: {
-        autoCheckUpdates: config.get('autoCheckUpdates'),
-        installationScope: config.get('installationScope'),
-        enableLogging: config.get('enableLogging')
-      }
-    };
-
-    if (format === 'yaml') {
-      const yaml = await import('js-yaml');
-      return yaml.default.dump(settings, {
-        indent: 2,
-        lineWidth: 120,
-        noRefs: true
-      });
-    }
-
-    return JSON.stringify(settings, null, 2);
+    return await exportRegistrySettings(this.settingsPorts(), format);
   }
 
   /**
    * Import registry settings (sources + profiles + configuration)
+   *
+   * Thin delegator to `@ai-primitives-hub/app`'s
+   * `importRegistrySettings`.
    * @param data
    * @param format
    * @param strategy
@@ -2294,84 +1559,7 @@ export class RegistryManager {
     format: ExportFormat = 'json',
     strategy: ImportStrategy = 'merge'
   ): Promise<void> {
-    // Parse data
-    let settings: ExportedSettings;
-    try {
-      if (format === 'yaml') {
-        const yaml = await import('js-yaml');
-        settings = yaml.default.load(data) as ExportedSettings;
-      } else {
-        settings = JSON.parse(data);
-      }
-    } catch (error: any) {
-      throw new Error(`Invalid ${format.toUpperCase()} format: ${error.message}`);
-    }
-
-    // Validate schema version
-    if (!settings.version || settings.version !== '1.0.0') {
-      throw new Error(`Incompatible settings version: ${settings.version || 'unknown'}. Expected 1.0.0`);
-    }
-
-    // Validate required fields
-    if (!Array.isArray(settings.sources) || !Array.isArray(settings.profiles)) {
-      throw new Error('Invalid settings format: sources and profiles must be arrays');
-    }
-
-    // Clear if replacing
-    if (strategy === 'replace') {
-      await this.storage.clearAll();
-    }
-
-    // Import sources
-    for (const source of settings.sources) {
-      try {
-        const existingSources = await this.listSources();
-        const existing = existingSources.find((s) => s.id === source.id);
-
-        if (!existing || strategy === 'replace') {
-          // addSource will validate the source
-          await this.addSource(source);
-        }
-      } catch (error: any) {
-        Logger.getInstance().warn(`Failed to import source ${source.name}: ${error.message}`);
-      }
-    }
-
-    // Import profiles
-    for (const profile of settings.profiles) {
-      try {
-        const existingProfiles = await this.storage.getProfiles();
-        const existing = existingProfiles.find((p) => p.id === profile.id);
-
-        if (!existing || strategy === 'replace') {
-          // Reset timestamps and active state
-          profile.createdAt = new Date().toISOString();
-          profile.updatedAt = new Date().toISOString();
-          profile.active = false;
-
-          await this.storage.addProfile(profile);
-        }
-      } catch (error: any) {
-        Logger.getInstance().warn(`Failed to import profile ${profile.name}: ${error.message}`);
-      }
-    }
-
-    // Import configuration
-    if (settings.configuration) {
-      const config = vscode.workspace.getConfiguration('promptregistry');
-
-      if (settings.configuration.autoCheckUpdates !== undefined) {
-        await config.update('autoCheckUpdates', settings.configuration.autoCheckUpdates, true);
-      }
-      if (settings.configuration.installationScope !== undefined) {
-        await config.update('installationScope', settings.configuration.installationScope, true);
-      }
-      if (settings.configuration.enableLogging !== undefined) {
-        await config.update('enableLogging', settings.configuration.enableLogging, true);
-      }
-    }
-
-    // Settings imported - triggering UI refresh via source/profile events
+    await importRegistrySettings(this.settingsPorts(), data, format, strategy, (event) => this.forwardLogEvent(event));
   }
 
   /**

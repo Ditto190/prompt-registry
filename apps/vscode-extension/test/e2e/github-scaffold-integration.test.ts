@@ -337,7 +337,9 @@ suite('E2E: GitHub Scaffold Integration Tests', () => {
         'build-collection-bundle',
         'publish-collections',
         'list-collections',
-        'compute-collection-version'
+        'compute-collection-version',
+        'skill:validate',
+        'skill:create'
       ];
       for (const script of requiredScripts) {
         assert.ok(
@@ -561,21 +563,22 @@ suite('E2E: Script Execution Tests', () => {
       fs.readFileSync(path.join(testDir, 'package.json'), 'utf8')
     );
 
-    // Verify @prompt-registry/collection-scripts is a dependency
-    const hasDep = (packageJson.dependencies && packageJson.dependencies['@prompt-registry/collection-scripts'])
-      || (packageJson.devDependencies && packageJson.devDependencies['@prompt-registry/collection-scripts']);
+    // Verify @ai-primitives-hub/cli is a dependency
+    const hasDep = (packageJson.dependencies && packageJson.dependencies['@ai-primitives-hub/cli'])
+      || (packageJson.devDependencies && packageJson.devDependencies['@ai-primitives-hub/cli']);
     assert.ok(
       hasDep,
-      'package.json should depend on @prompt-registry/collection-scripts'
+      'package.json should depend on @ai-primitives-hub/cli'
     );
 
-    // Verify npm scripts reference the package commands
+    // Verify npm scripts reference the ai-primitives-hub CLI commands
     const expectedScriptCommands: Record<string, string> = {
-      validate: 'validate-collections',
-      'build-collection-bundle': 'build-collection-bundle',
-      'publish-collections': 'publish-collections',
-      'list-collections': 'list-collections',
-      'compute-collection-version': 'compute-collection-version'
+      validate: 'ai-primitives-hub collection validate',
+      'build-collection-bundle': 'ai-primitives-hub bundle build',
+      'list-collections': 'ai-primitives-hub collection list',
+      'compute-collection-version': 'ai-primitives-hub version compute',
+      'skill:validate': 'ai-primitives-hub skill validate',
+      'skill:create': 'ai-primitives-hub skill create'
     };
 
     for (const [scriptName, command] of Object.entries(expectedScriptCommands)) {
@@ -677,19 +680,19 @@ suite('E2E: Script Execution Tests', () => {
 
     // Verify README documents the available commands
     assert.ok(
-      content.includes('validate-collections'),
-      'Scripts README should document validate-collections command'
+      content.includes('ai-primitives-hub collection validate'),
+      'Scripts README should document collection validate command'
     );
     assert.ok(
-      content.includes('build-collection-bundle'),
-      'Scripts README should document build-collection-bundle command'
+      content.includes('ai-primitives-hub bundle build'),
+      'Scripts README should document bundle build command'
     );
     assert.ok(
-      content.includes('publish-collections'),
-      'Scripts README should document publish-collections command'
+      content.includes('ai-primitives-hub skill validate'),
+      'Scripts README should document skill validate command'
     );
     assert.ok(
-      content.includes('@prompt-registry/collection-scripts'),
+      content.includes('@ai-primitives-hub/cli'),
       'Scripts README should reference the npm package'
     );
   });

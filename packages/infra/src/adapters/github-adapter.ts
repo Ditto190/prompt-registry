@@ -79,6 +79,8 @@ interface DeploymentManifest {
   tags?: string[];
   dependencies?: Bundle['dependencies'];
   license?: string;
+  /** Name of the README asset on the release, if any. */
+  readme?: string;
   /** Read only for the Marketplace webview's content-breakdown UI - see this module's own doc. */
   prompts?: unknown[];
   /** Read only for the Marketplace webview's content-breakdown UI - see this module's own doc. */
@@ -209,6 +211,10 @@ export class GitHubAdapter extends BaseSourceAdapter {
 
     const bundleId = generateGitHubReleaseBundleId(owner, repo, release.tag_name, manifest?.id, manifest?.version);
 
+    const readmeAsset = manifest?.readme
+      ? release.assets.find((asset) => asset.name.toLowerCase() === manifest.readme!.toLowerCase())
+      : undefined;
+
     const bundle: Bundle = {
       id: bundleId,
       name: manifest?.name ?? release.name ?? `${repo} ${release.tag_name}`,
@@ -224,7 +230,9 @@ export class GitHubAdapter extends BaseSourceAdapter {
       license: manifest?.license ?? 'Unknown',
       manifestUrl: manifestAsset.url,
       downloadUrl: bundleAsset.url,
-      repository: this.source.url
+      repository: this.source.url,
+      readmeUrl: readmeAsset?.url,
+      readmeRevision: release.tag_name
     };
 
     // Attach prompts/mcpServers from the manifest for the Marketplace
@@ -274,6 +282,17 @@ export class GitHubAdapter extends BaseSourceAdapter {
       return Buffer.from(bytes);
     } catch (error) {
       throw new Error(`Failed to download bundle: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  public async downloadReadme(bundle: Bundle): Promise<string | null> {
+    if (!bundle.readmeUrl) {
+      return null;
+    }
+    try {
+      return await this.githubApi.getText(bundle.readmeUrl);
+    } catch {
+      return null;
     }
   }
 

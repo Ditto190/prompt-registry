@@ -181,8 +181,8 @@ This is an example prompt for testing.
       // Verify README references the npm package validation command
       const readmeContent = fs.readFileSync(scriptsReadme, 'utf8');
       assert.ok(
-        readmeContent.includes('validate-skills') || readmeContent.includes('@prompt-registry/collection-scripts'),
-        'Scripts README should reference validate-skills command or npm package'
+        readmeContent.includes('ai-primitives-hub skill validate') || readmeContent.includes('@ai-primitives-hub/cli'),
+        'Scripts README should reference skill validate command or npm package'
       );
     });
 
@@ -201,9 +201,9 @@ This is an example prompt for testing.
       const packageJsonPath = path.join(projectDir, 'package.json');
       const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
       assert.ok(
-        packageJson.devDependencies?.['@prompt-registry/collection-scripts']
-        || packageJson.dependencies?.['@prompt-registry/collection-scripts'],
-        'Package should include @prompt-registry/collection-scripts for skill creation'
+        packageJson.devDependencies?.['@ai-primitives-hub/cli']
+        || packageJson.dependencies?.['@ai-primitives-hub/cli'],
+        'Package should include @ai-primitives-hub/cli for skill creation'
       );
     });
 

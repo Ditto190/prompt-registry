@@ -1,8 +1,8 @@
-import * as tls from 'node:tls';
 import {
-  Client,
-  ClientOptions,
-} from '@elastic/elasticsearch';
+  ElasticSearchTransport as CoreElasticSearchTransport,
+  ElasticSearchTransportOptions as CoreElasticSearchTransportOptions,
+  nodeCACertificateReader,
+} from '@ai-primitives-hub/infra';
 import * as vscode from 'vscode';
 import {
   ElasticSearchConfig,
@@ -18,35 +18,49 @@ import {
   HubManager,
 } from './hub-manager';
 
-interface ActiveClient {
-  client: Client;
-  indexPrefix: string;
-  hubId: string;
-}
-
-/** Maximum queued documents before oldest entries are dropped. */
-const MAX_QUEUE_SIZE = 500;
-
-/** Interval in milliseconds between batched flushes. */
-const FLUSH_INTERVAL_MS = 10_000;
-
 /**
  * Manages the Elastic Search transport layer for telemetry.
  *
- * Handles ES client lifecycle (connect/disconnect per hub), event queuing
- * during startup, batched bulk indexing every 10s, and monthly index rotation.
+ * Thin wrapper around `@ai-primitives-hub/infra`'s `ElasticSearchTransport`,
+ * which owns the ES client lifecycle
+ * (connect/disconnect per hub), event queuing during startup, batched bulk
+ * indexing every 10s, monthly index rotation, and corporate-proxy CA-cert
+ * trust merging. This class keeps only the VS Code-specific hub-event
+ * subscription wiring (`subscribeToHubEvents`) — left extension-side
+ * deliberately, per the same "VS Code-event-driven glue with a single
+ * consumer, no CLI need yet" precedent as `HubSyncScheduler` (confirmed
+ * with the user rather than assumed) — plus routing the ported class's
+ * log callback to this extension's `Logger` and optional debug channel.
  *
  * Authentication is handled by the es-telemetry-proxy — this client sends
  * unauthenticated requests to the proxy URL.
  */
 export class ElasticSearchTransport implements TelemetryTransport {
-  private activeClient: ActiveClient | undefined;
-  private readonly pendingDocuments: TelemetryDocument[] = [];
+  private readonly transport: CoreElasticSearchTransport;
   private readonly logger = Logger.getInstance();
   private debugChannel: vscode.OutputChannel | undefined;
   private disposables: vscode.Disposable[] = [];
-  private flushTimer: ReturnType<typeof setInterval> | undefined;
-  private warnedNoSystemCaApi = false;
+
+  /**
+   * Construct the transport, wiring the underlying `infra` transport's
+   * log sink and (real, unless overridden) CA-certificate reader.
+   * @param options - Overrides for the underlying `infra` transport's ES
+   * client builder / CA-certificate reader (test-only; production code
+   * should call this with no arguments).
+   */
+  constructor(options?: Pick<CoreElasticSearchTransportOptions, 'createClient' | 'getCACertificates'>) {
+    // `options` is only ever supplied by tests, to inject a stub ES client
+    // (and optionally a stub CA-certificate reader). When omitted entirely
+    // (production), the real reader is auto-detected; when supplied without
+    // a `getCACertificates` key, it stays `undefined` (CA-merging disabled)
+    // rather than falling back to the real reader — tests need to be able to
+    // force that "unavailable" case regardless of the host's Node version.
+    this.transport = new CoreElasticSearchTransport({
+      onLog: (level, message) => this.log(level, message),
+      getCACertificates: options ? options.getCACertificates : nodeCACertificateReader(),
+      createClient: options?.createClient
+    });
+  }
 
   private log(level: 'debug' | 'info' | 'warn' | 'error', message: string): void {
     // Route every level through the main logger (which gates by LOG_LEVEL) so the
@@ -60,105 +74,13 @@ export class ElasticSearchTransport implements TelemetryTransport {
     }
   }
 
-  private closeActiveClient(): void {
-    if (this.activeClient) {
-      void this.activeClient.client.close().catch(() => { /* best-effort */ });
-      this.activeClient = undefined;
-    }
-  }
-
-  private stopFlushTimer(): void {
-    if (this.flushTimer !== undefined) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = undefined;
-    }
-  }
-
-  private startFlushTimer(): void {
-    this.stopFlushTimer();
-    this.flushTimer = setInterval(() => {
-      this.flushPending();
-    }, FLUSH_INTERVAL_MS);
-  }
-
-  private flushPending(): void {
-    if (!this.activeClient || this.pendingDocuments.length === 0) {
-      return;
-    }
-    const docs = this.pendingDocuments.splice(0);
-    this.log('info', `Flushing ${docs.length} event(s) to hub "${this.activeClient.hubId}"`);
-    this.indexDocuments(this.activeClient, docs);
-  }
-
-  /**
-   * Compute the current monthly index name from the stored prefix.
-   * @param prefix - the index name prefix
-   */
-  private static currentIndexName(prefix: string): string {
-    const monthSuffix = new Date().toISOString().slice(0, 7);
-    return `${prefix}-${monthSuffix}`;
-  }
-
-  private indexDocuments(target: ActiveClient, docs: TelemetryDocument[]): void {
-    const { client, indexPrefix, hubId } = target;
-    const indexName = ElasticSearchTransport.currentIndexName(indexPrefix);
-    client.helpers.bulk({
-      index: indexName,
-      datasource: docs,
-      onDocument: () => ({ index: {} })
-    }).catch((err: unknown) => {
-      this.log('error', `Failed to index ${docs.length} event(s) to hub "${hubId}": ${err}`);
-    });
-  }
-
-  /**
-   * Build the CA trust bundle the ES client should use.
-   *
-   * Corporate TLS-inspection proxies (e.g. Netskope) re-sign connections with a
-   * CA that lives in the OS trust store, which Node ignores in favour of its own
-   * bundled Mozilla roots. We merge the OS store ('system') with Node's defaults
-   * ('default', which also includes NODE_EXTRA_CA_CERTS) so the re-signed cert
-   * validates without disabling verification.
-   *
-   * Returns `undefined` (leaving Node's default trust untouched) when the runtime
-   * lacks `tls.getCACertificates` (Node < 22.15) or the system store yields nothing.
-   */
-  private resolveCACertificates(): string[] | undefined {
-    if (typeof tls.getCACertificates !== 'function') {
-      if (!this.warnedNoSystemCaApi) {
-        this.warnedNoSystemCaApi = true;
-        this.log('warn', 'tls.getCACertificates unavailable on this runtime (Node < 22.15); system-CA trust disabled');
-      }
-      return undefined;
-    }
-
-    const readStore = (store: 'system' | 'default'): string[] => {
-      try {
-        return tls.getCACertificates(store);
-      } catch {
-        return [];
-      }
-    };
-
-    const system = readStore('system');
-    if (system.length === 0) {
-      return undefined;
-    }
-
-    return Array.from(new Set([...system, ...readStore('default')]));
-  }
-
   /**
    * Buffer a document for the next batched flush (every 10s).
    * If no client is active, documents are queued until one registers.
    * @param doc - the telemetry document to send
    */
   public send(doc: TelemetryDocument): void {
-    this.log('info', `Buffering event: ${doc.eventName ?? 'error'}`);
-    if (this.pendingDocuments.length >= MAX_QUEUE_SIZE) {
-      this.pendingDocuments.shift();
-    }
-    this.pendingDocuments.push(doc);
+    this.transport.send(doc);
   }
 
   /**
@@ -169,40 +91,7 @@ export class ElasticSearchTransport implements TelemetryTransport {
    * @param config - Elastic Search connection configuration (proxy URL)
    */
   public async registerHub(hubId: string, config: ElasticSearchConfig): Promise<void> {
-    try {
-      this.log('info', `Registering ES client for hub "${hubId}" at ${config.node}`);
-      this.closeActiveClient();
-      this.stopFlushTimer();
-
-      const ca = this.resolveCACertificates();
-      const clientOptions: ClientOptions = { node: config.node };
-      if (ca) {
-        clientOptions.tls = { ca };
-        this.log('info', `Loaded ${ca.length} CA certificate(s) from the system + default trust stores`);
-      } else {
-        this.log('info', 'Using Node default CA trust (no system-store certificates merged)');
-      }
-      const client = new Client(clientOptions);
-
-      const indexPrefix = config.indexPrefix ?? 'prompt-registry-telemetry';
-      const indexName = ElasticSearchTransport.currentIndexName(indexPrefix);
-
-      try {
-        await client.indices.create({ index: indexName });
-      } catch (err: unknown) {
-        if (!isIndexAlreadyExistsError(err)) {
-          throw err;
-        }
-      }
-
-      this.activeClient = { client, indexPrefix, hubId };
-      this.log('info', `Registered ES client for hub "${hubId}" at ${config.node} (index "${indexName}")`);
-
-      this.flushPending();
-      this.startFlushTimer();
-    } catch (error) {
-      this.log('error', `Failed to register ES client for hub "${hubId}": ${error}`);
-    }
+    await this.transport.registerHub(hubId, config);
   }
 
   /**
@@ -210,12 +99,7 @@ export class ElasticSearchTransport implements TelemetryTransport {
    * @param hubId - the hub identifier to unregister
    */
   public unregisterHub(hubId: string): void {
-    if (this.activeClient?.hubId === hubId) {
-      this.closeActiveClient();
-      this.stopFlushTimer();
-      this.pendingDocuments.length = 0;
-      this.log('info', `Unregistered ES client for hub "${hubId}"`);
-    }
+    this.transport.unregisterHub(hubId);
   }
 
   /**
@@ -282,17 +166,7 @@ export class ElasticSearchTransport implements TelemetryTransport {
   public dispose(): void {
     this.disposables.forEach((d) => d.dispose());
     this.disposables = [];
-    this.stopFlushTimer();
-    this.pendingDocuments.length = 0;
-    this.closeActiveClient();
+    this.transport.dispose();
     this.debugChannel?.dispose();
   }
-}
-
-function isIndexAlreadyExistsError(err: unknown): boolean {
-  if (typeof err !== 'object' || err === null) {
-    return false;
-  }
-  const e = err as { meta?: { body?: { error?: { type?: string } } } };
-  return e.meta?.body?.error?.type === 'resource_already_exists_exception';
 }

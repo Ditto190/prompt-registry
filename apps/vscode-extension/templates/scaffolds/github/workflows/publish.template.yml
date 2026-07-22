@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: write
       packages: read
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -32,16 +32,48 @@ jobs:
 
       - name: Publish affected collections
         # NOTE: github.event.before may be all zeros (0000000...) on the first push to a
-        # branch or after a force-push. The publish script handles this by falling back
-        # to HEAD~1 if it exists, or returning no changed paths for an initial commit
-        # (which skips publishing).
+        # branch or after a force-push. We treat an all-zero base as an initial commit
+        # and skip affected-file detection.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_BASE_SHA: ${{ github.event.before }}
           GITHUB_HEAD_SHA: ${{ github.sha }}
         run: |
-          npx publish-collections
+          set -euo pipefail
+
+          if [ "$GITHUB_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "Initial push detected; no affected collections to publish."
+            exit 0
+          fi
+
+          changed_paths=$(git diff --name-only "$GITHUB_BASE_SHA" "$GITHUB_HEAD_SHA" || true)
+          if [ -z "$changed_paths" ]; then
+            echo "No changed paths detected."
+            exit 0
+          fi
+
+          affected_files=$(npx ai-primitives-hub collection affected -o json $(printf ' --changed-path %s' $changed_paths) | jq -r '.data.affected[].file')
+          if [ -z "$affected_files" ]; then
+            echo "No affected collections."
+            exit 0
+          fi
+
+          for file in $affected_files; do
+            collection_id=$(basename "$file" .collection.yml)
+            version_data=$(npx ai-primitives-hub version compute --collection-file "$file" -o json)
+            version=$(echo "$version_data" | jq -r '.data.nextVersion')
+            tag=$(echo "$version_data" | jq -r '.data.tag')
+
+            echo "Publishing $collection_id @ $version (tag: $tag)"
+            npx ai-primitives-hub bundle build --collection-file "$file" --version "$version" --out-dir "dist/$collection_id"
+
+            gh release create "$tag" \
+              --title "$collection_id $version" \
+              --notes "Release $tag" \
+              "dist/$collection_id/$collection_id.bundle.zip" \
+              "dist/$collection_id/deployment-manifest.yml"
+          done
 
   publish-preview:
     name: Preview Collection Releases (PR)
@@ -76,12 +108,31 @@ jobs:
         if: steps.setup.outputs.validation-status == 'failure'
         run: exit 1
 
-      - name: Preview affected collections (dry-run)
+      - name: Preview affected collections
         env:
           GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          npx publish-collections --dry-run
+          set -euo pipefail
+
+          changed_paths=$(git diff --name-only "$GITHUB_BASE_SHA" "$GITHUB_HEAD_SHA" || true)
+          if [ -z "$changed_paths" ]; then
+            echo "No changed paths detected."
+            exit 0
+          fi
+
+          affected_files=$(npx ai-primitives-hub collection affected -o json $(printf ' --changed-path %s' $changed_paths) | jq -r '.data.affected[].file')
+          if [ -z "$affected_files" ]; then
+            echo "No affected collections."
+            exit 0
+          fi
+
+          for file in $affected_files; do
+            collection_id=$(basename "$file" .collection.yml)
+            version=$(npx ai-primitives-hub version compute --collection-file "$file" -o json | jq -r '.data.nextVersion')
+            echo "Previewing $collection_id @ $version"
+            npx ai-primitives-hub bundle build --collection-file "$file" --version "$version" --out-dir "dist/$collection_id"
+          done
 
       - name: Upload preview artifacts
         if: always()

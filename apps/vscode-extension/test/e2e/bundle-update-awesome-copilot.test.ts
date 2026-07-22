@@ -190,8 +190,8 @@ Content: ${content}
       // Clear the adapter's cache to force a fresh fetch
       const adapters = (testContext.registryManager as any).adapters;
       for (const [, adapter] of adapters) {
-        if (adapter.collectionsCache) {
-          adapter.collectionsCache.clear();
+        if (typeof adapter.clearCache === 'function') {
+          adapter.clearCache();
         }
       }
 
@@ -281,8 +281,8 @@ Content: ${content}
       // Clear the adapter's cache to force a fresh fetch
       const adapters = (testContext.registryManager as any).adapters;
       for (const [, adapter] of adapters) {
-        if (adapter.collectionsCache) {
-          adapter.collectionsCache.clear();
+        if (typeof adapter.clearCache === 'function') {
+          adapter.clearCache();
         }
       }
 
@@ -366,8 +366,8 @@ Content: ${content}
       // Clear the adapter's cache to force a fresh fetch
       const adapters2 = (testContext.registryManager as any).adapters;
       for (const [, adapter] of adapters2) {
-        if (adapter.collectionsCache) {
-          adapter.collectionsCache.clear();
+        if (typeof adapter.clearCache === 'function') {
+          adapter.clearCache();
         }
       }
 
@@ -444,8 +444,8 @@ Content: ${content}
       // Clear the adapter's cache to force a fresh fetch
       const adapters3 = (testContext.registryManager as any).adapters;
       for (const [, adapter] of adapters3) {
-        if (adapter.collectionsCache) {
-          adapter.collectionsCache.clear();
+        if (typeof adapter.clearCache === 'function') {
+          adapter.clearCache();
         }
       }
 

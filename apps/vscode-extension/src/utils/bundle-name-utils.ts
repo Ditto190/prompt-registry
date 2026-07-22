@@ -60,6 +60,11 @@ export interface BundleDetailsResolver {
  * - Exact match: manifestId === bundleId
  * - Suffix match with 'v' prefix: bundleId ends with `-{manifestId}-v{manifestVersion}`
  * - Suffix match without 'v' prefix: bundleId ends with `-{manifestId}-{manifestVersion}`
+ *
+ * IMPORTANT: This logic has also been ported to `@ai-primitives-hub/core`'s
+ * `domain/bundle/id.ts` (used by `BundleInstaller.validateBundle()` via
+ * `validateManifest()`). Keep both in sync until this call site is migrated
+ * onto the core implementation.
  * @param manifestId - The ID from the deployment manifest
  * @param manifestVersion - The version from the deployment manifest
  * @param bundleId - The computed bundle ID

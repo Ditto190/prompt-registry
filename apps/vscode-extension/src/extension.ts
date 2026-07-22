@@ -63,6 +63,9 @@ import {
   AutoUpdateService,
 } from './services/auto-update-service';
 import {
+  ElasticSearchTransport,
+} from './services/elastic-search-transport';
+import {
   HubManager,
 } from './services/hub-manager';
 import {
@@ -214,7 +217,6 @@ export class PromptRegistryExtension {
       this.telemetryService.addTransport(new OutputChannelTransport());
 
       if (this.hubManager) {
-        const { ElasticSearchTransport } = await import('./services/elastic-search-transport');
         const esTransport = new ElasticSearchTransport();
         esTransport.subscribeToHubEvents(this.hubManager);
         this.telemetryService.addTransport(esTransport);

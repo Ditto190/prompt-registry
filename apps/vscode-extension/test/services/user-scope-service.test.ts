@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as sinon from 'sinon';
+import * as vscode from 'vscode';
 import {
   UserScopeService,
 } from '../../src/services/user-scope-service';
@@ -40,7 +41,7 @@ suite('UserScopeService', () => {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    service = new UserScopeService(mockContext);
+    service = new UserScopeService(mockContext, tempDir);
   });
 
   teardown(() => {
@@ -100,6 +101,104 @@ prompts: []
       } catch (error) {
         assert.ok(error, 'Should throw error for invalid bundle path');
       }
+    });
+  });
+
+  suite('Kiro target installation', () => {
+    test('uses the Kiro layout and transforms agent frontmatter', async () => {
+      const bundleId = 'kiro-agent-bundle';
+      const bundlePath = path.join(tempDir, 'kiro-bundle');
+      const agentPath = path.join(bundlePath, 'agents', 'review-agent.md');
+      fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+      fs.writeFileSync(agentPath, '---\ntitle: "Review Agent"\n---\nReview code.');
+      fs.writeFileSync(path.join(bundlePath, 'deployment-manifest.yml'), `
+id: ${bundleId}
+version: "1.0.0"
+prompts:
+  - id: review-agent
+    name: Review Agent
+    file: agents/review-agent.md
+    type: agent
+`);
+
+      const kiroService = new UserScopeService(mockContext, tempDir, 'kiro');
+      await kiroService.syncBundle(bundleId, bundlePath);
+
+      const targetPath = path.join(tempDir, '.kiro', 'agents', 'review-agent.agent.md');
+      assert.ok(fs.existsSync(targetPath), 'Kiro agent should be written under ~/.kiro/agents');
+      assert.ok(fs.readFileSync(targetPath, 'utf8').includes('name: "Review Agent"'));
+    });
+  });
+
+  suite('Target type detection', () => {
+    let originalAppName: string;
+    let originalUriScheme: string;
+
+    setup(() => {
+      originalAppName = vscode.env.appName;
+      originalUriScheme = vscode.env.uriScheme;
+    });
+
+    teardown(() => {
+      (vscode.env as any).appName = originalAppName;
+      (vscode.env as any).uriScheme = originalUriScheme;
+    });
+
+    const createPromptBundle = (bundleId: string, bundlePath: string) => {
+      const promptsDir = path.join(bundlePath, 'prompts');
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.writeFileSync(path.join(promptsDir, 'test-prompt.md'), '# Test prompt');
+      fs.writeFileSync(path.join(bundlePath, 'deployment-manifest.yml'), `
+id: ${bundleId}
+version: "1.0.0"
+prompts:
+  - id: test-prompt
+    name: Test Prompt
+    file: prompts/test-prompt.md
+    type: prompt
+`);
+    };
+
+    test('detects Devin by appName and uses Windsurf layout', async () => {
+      const bundleId = 'devin-prompt-bundle';
+      const bundlePath = path.join(tempDir, 'devin-bundle');
+      createPromptBundle(bundleId, bundlePath);
+
+      (vscode.env as any).appName = 'Devin';
+      (vscode.env as any).uriScheme = 'devin';
+      const devinService = new UserScopeService(mockContext, tempDir);
+      await devinService.syncBundle(bundleId, bundlePath);
+
+      const targetPath = path.join(tempDir, '.codeium', 'windsurf', 'rules', 'test-prompt.prompt.md');
+      assert.ok(fs.existsSync(targetPath), `Prompt should be written to Windsurf rules: ${targetPath}`);
+    });
+
+    test('detects Windsurf by uriScheme fallback', async () => {
+      const bundleId = 'windsurf-prompt-bundle';
+      const bundlePath = path.join(tempDir, 'windsurf-bundle');
+      createPromptBundle(bundleId, bundlePath);
+
+      (vscode.env as any).appName = 'Visual Studio Code';
+      (vscode.env as any).uriScheme = 'windsurf';
+      const windsurfService = new UserScopeService(mockContext, tempDir);
+      await windsurfService.syncBundle(bundleId, bundlePath);
+
+      const targetPath = path.join(tempDir, '.codeium', 'windsurf', 'rules', 'test-prompt.prompt.md');
+      assert.ok(fs.existsSync(targetPath), `Prompt should be written to Windsurf rules: ${targetPath}`);
+    });
+
+    test('detects vscode-insiders by appName', async () => {
+      const bundleId = 'insiders-prompt-bundle';
+      const bundlePath = path.join(tempDir, 'insiders-bundle');
+      createPromptBundle(bundleId, bundlePath);
+
+      (vscode.env as any).appName = 'Visual Studio Code - Insiders';
+      (vscode.env as any).uriScheme = 'vscode-insiders';
+      const insidersService = new UserScopeService(mockContext, tempDir);
+      await insidersService.syncBundle(bundleId, bundlePath);
+
+      const targetPath = path.join(tempDir, '.copilot', 'prompts', 'test-prompt.prompt.md');
+      assert.ok(fs.existsSync(targetPath), `Prompt should be written to generic Copilot prompts: ${targetPath}`);
     });
   });
 

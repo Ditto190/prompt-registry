@@ -8,6 +8,10 @@ import * as path from 'node:path';
 import {
   promisify,
 } from 'node:util';
+import type {
+  AppStorage,
+  AppStoragePaths,
+} from '@ai-primitives-hub/core';
 import * as vscode from 'vscode';
 import {
   Bundle,
@@ -18,6 +22,9 @@ import {
   RegistrySettings,
   RegistrySource,
 } from '../types/registry';
+import {
+  VsCodeAppStorage,
+} from './vscode-app-storage';
 
 const readFile = promisify(fs.readFile);
 const writeFile = promisify(fs.writeFile);
@@ -29,18 +36,7 @@ const unlink = promisify(fs.unlink);
 /**
  * Storage paths
  */
-interface StoragePaths {
-  root: string;
-  config: string;
-  cache: string;
-  sourcesCache: string;
-  bundlesCache: string;
-  installed: string;
-  userInstalled: string;
-  profilesInstalled: string;
-  profiles: string;
-  logs: string;
-}
+type StoragePaths = AppStoragePaths;
 
 /**
  * Default registry settings
@@ -72,6 +68,7 @@ export class RegistryStorage {
   private static readonly MAX_FILENAME_LENGTH = 200;
   private static readonly ALLOWED_CHARS_REGEX = /[^A-Za-z0-9._-]/g;
   private readonly paths: StoragePaths;
+  private readonly appStorage: AppStorage;
   private configCache?: RegistryConfig;
 
   // ===== Update Preferences Management =====
@@ -81,21 +78,18 @@ export class RegistryStorage {
    */
   private readonly UPDATE_PREFERENCES_KEY = 'bundleUpdatePreferences';
 
-  constructor(private readonly context: vscode.ExtensionContext) {
-    const storagePath = context.globalStorageUri.fsPath;
-
-    this.paths = {
-      root: storagePath,
-      config: path.join(storagePath, 'config.json'),
-      cache: path.join(storagePath, 'cache'),
-      sourcesCache: path.join(storagePath, 'cache', 'sources'),
-      bundlesCache: path.join(storagePath, 'cache', 'bundles'),
-      installed: path.join(storagePath, 'installed'),
-      userInstalled: path.join(storagePath, 'installed', 'user'),
-      profilesInstalled: path.join(storagePath, 'installed', 'profiles'),
-      profiles: path.join(storagePath, 'profiles'),
-      logs: path.join(storagePath, 'logs')
-    };
+  /**
+   * Create a RegistryStorage.
+   * @param context - VS Code extension context.
+   * @param storage - Storage-root/state port (ADR-0005). Defaults to
+   *   `VsCodeAppStorage`, backed by `context.globalStorageUri`/
+   *   `context.globalState` — the extension's existing, unchanged
+   *   on-disk layout. Injectable for tests and for any future
+   *   non-VS-Code caller (e.g. `infra`'s `XdgAppStorage`).
+   */
+  constructor(private readonly context: vscode.ExtensionContext, storage?: AppStorage) {
+    this.appStorage = storage ?? new VsCodeAppStorage(context);
+    this.paths = this.appStorage.getPaths();
   }
 
   /**
@@ -542,11 +536,10 @@ export class RegistryStorage {
    * Get all update preferences
    */
   public async getUpdatePreferences(): Promise<Record<string, { autoUpdate: boolean; lastChecked?: string }>> {
-    const prefs = this.context.globalState.get<Record<string, { autoUpdate: boolean; lastChecked?: string }>>(
+    return this.appStorage.getState<Record<string, { autoUpdate: boolean; lastChecked?: string }>>(
       this.UPDATE_PREFERENCES_KEY,
       {}
     );
-    return prefs;
   }
 
   /**
@@ -560,7 +553,7 @@ export class RegistryStorage {
       autoUpdate,
       lastChecked: new Date().toISOString()
     };
-    await this.context.globalState.update(this.UPDATE_PREFERENCES_KEY, prefs);
+    await this.appStorage.setState(this.UPDATE_PREFERENCES_KEY, prefs);
   }
 
   /**

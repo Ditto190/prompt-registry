@@ -1,6 +1,6 @@
 {
     "version": "2.0.0",
-    "description": "GitHub Workflow Bundle Scaffold (uses @prompt-registry/collection-scripts npm package)",
+    "description": "GitHub Workflow Bundle Scaffold (uses @ai-primitives-hub/cli npm package)",
     "templates": {
         "package-json": {
             "path": "package.template.json",

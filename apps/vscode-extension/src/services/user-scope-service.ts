@@ -24,22 +24,29 @@ import * as path from 'node:path';
 import {
   promisify,
 } from 'node:util';
+import {
+  expandPath,
+  resolveLayout,
+  TransformerRegistry,
+} from '@ai-primitives-hub/app';
+import {
+  determineFileType,
+  getSkillName,
+  getTargetFileName,
+} from '@ai-primitives-hub/core';
+import type {
+  CopilotFileType,
+  Target,
+  TargetType,
+} from '@ai-primitives-hub/core';
 import * as yaml from 'js-yaml';
 import * as vscode from 'vscode';
 import {
   DeploymentManifest,
 } from '../types/registry';
 import {
-  CopilotFileType,
-  determineFileType,
-  getTargetFileName,
-} from '../utils/copilot-file-type-utils';
-import {
   Logger,
 } from '../utils/logger';
-import {
-  escapeRegex,
-} from '../utils/regex-utils';
 import {
   checkPathExists,
 } from '../utils/symlink-utils';
@@ -61,9 +68,8 @@ export interface CopilotFile {
   name: string;
   sourcePath: string;
   targetPath: string;
+  transformedContent?: string;
 }
-
-type CodeFlavourFolder = 'Code' | 'Code - Insiders';
 
 /**
  * Service to sync bundle prompts to GitHub Copilot's native directories at user level.
@@ -71,16 +77,95 @@ type CodeFlavourFolder = 'Code' | 'Code - Insiders';
  */
 export class UserScopeService implements IScopeService {
   private readonly logger: Logger;
-  private readonly appNameMap: Map<string, CodeFlavourFolder> = new Map([
-    ['vscode', 'Code'],
-    ['vscode-insiders', 'Code - Insiders']
-  ]);
-
+  private readonly homeDir: string;
+  private readonly targetType: TargetType;
+  private readonly transformerRegistry = TransformerRegistry.withBuiltIns();
   private windowsHomeInWSL: string | undefined;
+  private warnedWslFallback = false;
   private cachedPromptsDir: string | undefined;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(private readonly context: vscode.ExtensionContext, homeDir = os.homedir(), targetType?: TargetType) {
     this.logger = Logger.getInstance();
+    this.homeDir = homeDir;
+    this.targetType = targetType ?? this.detectTargetType();
+  }
+
+  private detectTargetType(): TargetType {
+    const appName = (vscode.env.appName ?? '').toLowerCase();
+    const uriScheme = (vscode.env.uriScheme ?? '').toLowerCase();
+
+    this.logger.debug(`[UserScopeService] detectTargetType: appName=${vscode.env.appName}, uriScheme=${vscode.env.uriScheme}`);
+
+    if (appName.includes('kiro') || uriScheme.includes('kiro')) {
+      this.logger.debug('[UserScopeService] Detected kiro target');
+      return 'kiro';
+    }
+
+    // Devin is the current rebrand of Windsurf; both use the same paths.
+    const windsurfId = appName.includes('windsurf') || appName.includes('devin')
+      || uriScheme.includes('windsurf') || uriScheme.includes('devin');
+    if (windsurfId) {
+      this.logger.debug('[UserScopeService] Detected windsurf target');
+      return 'windsurf';
+    }
+
+    const target = appName.includes('insiders') || uriScheme.includes('insiders') ? 'vscode-insiders' : 'vscode';
+    this.logger.debug(`[UserScopeService] Detected ${target} target`);
+    return target;
+  }
+
+  private getTarget(): Target {
+    return {
+      name: this.targetType,
+      type: this.targetType,
+      scope: 'user'
+    };
+  }
+
+  private getTargetBaseDirectory(): string {
+    const wslUserDir = this.getWindowsWslUserDir();
+    if (this.isRunningInWSL() && !wslUserDir && !this.warnedWslFallback) {
+      this.warnedWslFallback = true;
+      this.logger.warn('[UserScopeService] Unable to resolve Windows path from WSL. Generic Copilot primitives may not be visible.');
+      void vscode.window.showWarningMessage('AI Primitives Hub: Unable to resolve Windows path from WSL. Generic Copilot primitives may not be visible.');
+    }
+    const env = { HOME: wslUserDir ?? this.homeDir };
+    return expandPath(resolveLayout(this.getTarget()).baseDir, env);
+  }
+
+  private getTargetPrimitiveDirectory(type: CopilotFileType): string {
+    let routeKey: string;
+    switch (type) {
+      case 'prompt': {
+        routeKey = 'prompts/';
+        break;
+      }
+      case 'chatmode':
+      case 'agent': {
+        routeKey = 'agents/';
+        break;
+      }
+      case 'skill': {
+        routeKey = 'skills/';
+        break;
+      }
+      default: {
+        routeKey = 'instructions/';
+      }
+    }
+    const route = resolveLayout(this.getTarget()).kindRoutes[routeKey];
+    if (route === undefined) {
+      throw new Error(`No ${type} route defined for target ${this.targetType}`);
+    }
+    return path.join(this.getTargetBaseDirectory(), route);
+  }
+
+  private transformContent(filePath: string, content: string): string {
+    return this.transformerRegistry.getTransformer(this.targetType).transform({
+      target: this.getTarget(),
+      filePath,
+      content
+    }).content;
   }
 
   /**
@@ -112,27 +197,16 @@ export class UserScopeService implements IScopeService {
   }
 
   /**
-   * Get the Windows User directory when running in WSL.
-   * Since we construct the path ourselves, we return the User dir directly
-   * instead of globalStorage (avoiding redundant path parsing downstream).
-   * @returns The User directory path in WSL, or undefined if not in WSL or detection fails.
+   * Get the Windows home directory when running in WSL.
+   * Generic Copilot primitives are stored under the user's home, independently
+   * of whether the connected editor is VS Code stable or Insiders.
+   * @returns The Windows home directory path in WSL, or undefined if detection fails.
    */
   private getWindowsWslUserDir(): string | undefined {
     if (!this.isRunningInWSL()) {
       return undefined;
     }
-    try {
-      const windowsHome = this.getWindowsHomeDirectoryInWSL();
-      if (windowsHome) {
-        const folderName = this.appNameMap.get(vscode.env.uriScheme) || 'Code';
-        const userDir = path.join(windowsHome, 'AppData', 'Roaming', folderName, 'User');
-        this.logger.debug(`[UserScopeService] Resolved WSL User directory: ${userDir}`);
-        return userDir;
-      }
-    } catch {
-      this.logger.warn('[UserScopeService] Failed to resolve Windows path, falling back to WSL path');
-    }
-    return undefined;
+    return this.getWindowsHomeDirectoryInWSL();
   }
 
   /**
@@ -154,73 +228,10 @@ export class UserScopeService implements IScopeService {
       return this.cachedPromptsDir;
     }
 
-    const resolved = this.resolveCopilotPromptsDirectory();
-
-    // Sanity check: the resolved path should end with 'prompts' and not be a filesystem root
-    const basename = path.basename(resolved);
-    if (basename !== 'prompts' || resolved === path.dirname(resolved)) {
-      this.logger.warn(`[UserScopeService] Resolved prompts directory looks suspicious: ${resolved}`);
-    }
-
+    const resolved = this.getTargetPrimitiveDirectory('prompt');
+    this.logger.debug(`[UserScopeService] Resolved ${this.targetType} user primitive directory: ${resolved}`);
     this.cachedPromptsDir = resolved;
     return resolved;
-  }
-
-  private resolveCopilotPromptsDirectory(): string {
-    const globalStoragePath = this.context.globalStorageUri.fsPath;
-    this.logger.debug(`[UserScopeService] Original globalStorage path: ${globalStoragePath}`);
-
-    // WSL: we construct the path ourselves, so we know the User dir directly
-    const wslUserDir = this.getWindowsWslUserDir();
-    if (wslUserDir) {
-      return this.resolvePromptsFromUserDir(wslUserDir);
-    }
-
-    if (this.isRunningInWSL()) {
-      this.logger.warn('[UserScopeService] Unable to resolve Windows path from WSL. Prompts may not be visible to Copilot.');
-      vscode.window.showWarningMessage('AI Primitives Hub: Unable to resolve Windows path from WSL. Prompts may not be visible to Copilot.');
-    }
-
-    // Non-WSL: parse the User dir from the globalStorage path
-    const userIndex = globalStoragePath.lastIndexOf(path.sep + 'User' + path.sep);
-    const userDir = userIndex === -1
-      ? path.dirname(path.dirname(globalStoragePath))
-      : globalStoragePath.substring(0, userIndex + path.sep.length + 'User'.length);
-
-    // Check if the globalStorage path itself contains a profile segment
-    // Path structure: .../User/profiles/<profile-id>/globalStorage/...
-    const remainingPath = globalStoragePath.substring(userDir.length);
-    const escapedSep = escapeRegex(path.sep);
-    const profilesMatch = remainingPath.match(new RegExp(`^${escapedSep}profiles${escapedSep}([^${escapedSep}]+)`));
-    if (profilesMatch) {
-      const profileId = profilesMatch[1];
-      const profileName = this.getActiveProfileName(userDir) || profileId;
-      this.logger.info(`[UserScopeService] Using profile: ${profileName}`);
-      return path.join(userDir, 'profiles', profileId, 'prompts');
-    }
-
-    return this.resolvePromptsFromUserDir(userDir);
-  }
-
-  /**
-   * Given a known User directory, resolve the prompts directory
-   * (handles profile detection for both WSL and non-WSL paths).
-   * @param userDir
-   */
-  private resolvePromptsFromUserDir(userDir: string): string {
-    this.logger.debug(`[UserScopeService] Resolved User directory: ${userDir}`);
-
-    // Extension installed globally but user might be in a profile
-    // Use combined detection method (storage.json + filesystem heuristic)
-    const detectedProfile = this.detectActiveProfile(userDir);
-    if (detectedProfile) {
-      this.logger.info(`[UserScopeService] Using profile: ${detectedProfile.name}`);
-      return path.join(userDir, 'profiles', detectedProfile.id, 'prompts');
-    }
-
-    // Standard path: User/prompts
-    this.logger.info(`[UserScopeService] Using default profile`);
-    return path.join(userDir, 'prompts');
   }
 
   /**
@@ -362,8 +373,15 @@ export class UserScopeService implements IScopeService {
    */
   private async syncSkillFromBundle(bundleId: string, bundlePath: string, promptDef: any): Promise<void> {
     try {
+      // Extract skill name and source directory from the manifest file path
       const skillPath = promptDef.file;
-      const skillName = path.basename(path.dirname(skillPath));
+      const skillName = getSkillName(skillPath);
+
+      if (!skillName) {
+        this.logger.warn(`Invalid skill path: ${skillPath}`);
+        return;
+      }
+
       const skillSourceDir = path.join(bundlePath, path.dirname(skillPath));
 
       if (!fs.existsSync(skillSourceDir)) {
@@ -381,12 +399,14 @@ export class UserScopeService implements IScopeService {
   }
 
   /**
-   * Determine Copilot file type and target path
-   * Uses shared utility for file type detection
-   * @param promptDef
-   * @param sourcePath
-   * @param bundleId
+   * Get the generic Copilot directory for a primitive type.
+   * @param type - Copilot file type.
+   * @returns Absolute primitive directory.
    */
+  private getCopilotPrimitiveDirectory(type: CopilotFileType): string {
+    return this.getTargetPrimitiveDirectory(type);
+  }
+
   private determineCopilotFileType(
     promptDef: any,
     sourcePath: string,
@@ -398,10 +418,10 @@ export class UserScopeService implements IScopeService {
     // Use manifest type if provided, otherwise detect from file
     const type: CopilotFileType = promptDef.type ? promptDef.type as CopilotFileType : determineFileType(sourcePath, tags);
 
-    // Create target path: promptId.type.md directly in prompts directory
+    // Create target path: promptId.type.md directly in the generic Copilot directory
     const targetFileName = getTargetFileName(promptDef.id, type);
-    const promptsDir = this.getCopilotPromptsDirectory();
-    const targetPath = path.join(promptsDir, targetFileName);
+    const targetDir = this.getCopilotPrimitiveDirectory(type);
+    const targetPath = path.join(targetDir, targetFileName);
 
     return {
       bundleId,
@@ -448,10 +468,10 @@ export class UserScopeService implements IScopeService {
 
       // WSL: symlinks from Windows → WSL paths are broken from Windows' perspective,
       // so always copy when running in WSL. On non-WSL, prefer symlinks.
-      if (this.isRunningInWSL()) {
-        const content = await readFile(file.sourcePath, 'utf8');
+      if (file.transformedContent !== undefined || this.isRunningInWSL()) {
+        const content = file.transformedContent ?? await readFile(file.sourcePath, 'utf8');
         await writeFile(file.targetPath, content, 'utf8');
-        this.logger.debug(`Copied file (WSL): ${path.basename(file.targetPath)}`);
+        this.logger.debug(`Copied file${file.transformedContent === undefined ? ' (WSL)' : ' (transformed)'}: ${path.basename(file.targetPath)}`);
       } else {
         try {
           await symlink(file.sourcePath, file.targetPath, 'file');
@@ -591,6 +611,11 @@ export class UserScopeService implements IScopeService {
 
         // Detect file type and create appropriate filename
         const copilotFile = this.determineCopilotFileType(promptDef, sourcePath, bundleId);
+        const sourceContent = await readFile(sourcePath, 'utf8');
+        const transformedContent = this.transformContent(promptDef.file, sourceContent);
+        if (transformedContent !== sourceContent) {
+          copilotFile.transformedContent = transformedContent;
+        }
 
         // Create symlink or copy
         await this.createCopilotFile(copilotFile);
@@ -637,9 +662,8 @@ export class UserScopeService implements IScopeService {
       for (const promptDef of manifest.prompts) {
         // Handle skills differently - they are directories
         if (promptDef.type === 'skill') {
-          const skillMatch = promptDef.file.match(/skills\/([^/]+)\/SKILL\.md/);
-          if (skillMatch) {
-            const skillName = skillMatch[1];
+          const skillName = getSkillName(promptDef.file);
+          if (skillName) {
             await this.unsyncSkill(skillName, 'user');
             removedCount++;
           }
@@ -670,10 +694,11 @@ export class UserScopeService implements IScopeService {
                 this.logger.debug(`Target is a regular file, checking content before removal: ${path.basename(copilotFile.targetPath)}`);
                 const targetContent = await readFile(copilotFile.targetPath, 'utf8');
                 const sourceContent = await readFile(copilotFile.sourcePath, 'utf8');
+                const transformedContent = this.transformContent(promptDef.file, sourceContent);
 
                 // Normalize line endings (CRLF -> LF) for comparison
                 const normalizedTarget = targetContent.replace(/\r\n/g, '\n');
-                const normalizedSource = sourceContent.replace(/\r\n/g, '\n');
+                const normalizedSource = transformedContent.replace(/\r\n/g, '\n');
 
                 if (normalizedTarget === normalizedSource) {
                   await unlink(copilotFile.targetPath);
@@ -714,8 +739,7 @@ export class UserScopeService implements IScopeService {
       return path.join(workspaceFolders[0].uri.fsPath, '.copilot', 'skills');
     }
 
-    // User-level skills go to ~/.copilot/skills
-    return path.join(os.homedir(), '.copilot', 'skills');
+    return this.getTargetPrimitiveDirectory('skill');
   }
 
   /**
@@ -818,4 +842,4 @@ export class UserScopeService implements IScopeService {
 }
 
 // Re-export CopilotFileType for convenience
-export { CopilotFileType } from '../utils/copilot-file-type-utils';
+export type { CopilotFileType } from '@ai-primitives-hub/core';

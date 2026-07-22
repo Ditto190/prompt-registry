@@ -10,13 +10,32 @@
  * - The downloadFile() method has been removed as downloads are now handled by adapters
  */
 
+import {
+  createHash,
+} from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   promisify,
 } from 'node:util';
-// eslint-disable-next-line @typescript-eslint/no-require-imports -- top-level import, cannot use await import
-import AdmZip = require('adm-zip');
+import {
+  InstallPipeline,
+  InstallPipelineError,
+} from '@ai-primitives-hub/app';
+import type {
+  BundleDownloader,
+  BundleExtractor,
+  BundleResolver,
+  BundleSpec,
+  ExtractedFiles,
+  Installable,
+  Target,
+  TargetWriter,
+  TargetWriteResult,
+} from '@ai-primitives-hub/core';
+import {
+  ZipBundleExtractor,
+} from '@ai-primitives-hub/infra';
 import * as yaml from 'js-yaml';
 import * as vscode from 'vscode';
 import {
@@ -35,11 +54,9 @@ import {
   RepositoryCommitMode,
 } from '../types/registry';
 import {
-  isManifestIdMatch,
-} from '../utils/bundle-name-utils';
-import {
   determineFileType,
   getRepositoryTargetDirectory,
+  getSkillName,
   getTargetFileName,
   normalizePromptId,
 } from '../utils/copilot-file-type-utils';
@@ -75,7 +92,6 @@ import {
   UserScopeService,
 } from './user-scope-service';
 
-const mkdir = promisify(fs.mkdir);
 const writeFile = promisify(fs.writeFile);
 const readFile = promisify(fs.readFile);
 const readdir = promisify(fs.readdir);
@@ -303,103 +319,6 @@ export class BundleInstaller {
   // ===== Helper Methods =====
 
   /**
-   * Create temporary directory
-   */
-  private async createTempDir(): Promise<string> {
-    const tempBase = path.join(this.context.globalStorageUri.fsPath, 'temp');
-    await ensureDirectory(tempBase);
-
-    const tempDir = path.join(tempBase, `bundle-${Date.now()}`);
-    await mkdir(tempDir, { recursive: true });
-
-    return tempDir;
-  }
-
-  /**
-   * Extract bundle archive
-   * @param bundleFile
-   * @param extractDir
-   */
-  private async extractBundle(bundleFile: string, extractDir: string): Promise<void> {
-    await ensureDirectory(extractDir);
-
-    try {
-      // Use adm-zip for extraction
-      const zip = new AdmZip(bundleFile);
-      zip.extractAllTo(extractDir, true);
-    } catch (error) {
-      throw new Error(`Failed to extract bundle: ${(error as Error).message}`);
-    }
-  }
-
-  /**
-   * Validate bundle structure
-   * @param extractDir
-   * @param bundle
-   */
-  private async validateBundle(extractDir: string, bundle: Bundle): Promise<DeploymentManifest> {
-    // Check if deployment-manifest.yml exists
-    const manifestPath = path.join(extractDir, 'deployment-manifest.yml');
-
-    if (!fs.existsSync(manifestPath)) {
-      // For local bundles (like awesome-copilot), deployment-manifest.yml is optional
-      // Create a minimal manifest from the bundle info
-      this.logger.info(`No deployment-manifest.yml found for ${bundle.id}, creating minimal manifest`);
-      return {
-        common: {
-          directories: [],
-          files: [],
-          include_patterns: ['**/*'],
-          exclude_patterns: []
-        },
-        bundle_settings: {
-          include_common_in_environment_bundles: true,
-          create_common_bundle: true,
-          compression: 'none',
-          naming: {
-            environment_bundle: bundle.id
-          }
-        },
-        metadata: {
-          manifest_version: '1.0',
-          description: bundle.description || bundle.name || bundle.id,
-          author: 'awesome-copilot',
-          last_updated: new Date().toISOString()
-        }
-      };
-    }
-
-    this.logger.debug(`Validating manifest: ${manifestPath}`);
-
-    // Validate manifest content (parse YAML)
-    const manifestContent = await readFile(manifestPath, 'utf8');
-    const manifest = yaml.load(manifestContent) as any;
-
-    // Basic validation
-    if (!manifest.id || !manifest.version || !manifest.name) {
-      throw new Error('Invalid deployment manifest - missing required fields');
-    }
-
-    // Verify ID matches
-    // For GitHub bundles, the manifest may contain just the collection ID (e.g., "test2")
-    // while bundle.id is the full computed ID (e.g., "owner-repo-test2-v1.0.0" or "owner-repo-test2-1.0.0")
-    // Accept both exact match and suffix match for backward compatibility
-    // Handle both with and without 'v' prefix in version
-    if (!isManifestIdMatch(manifest.id, manifest.version, bundle.id)) {
-      throw new Error(`Bundle ID mismatch: expected ${bundle.id}, got ${manifest.id}`);
-    }
-
-    // Verify version matches (allow "latest" to match any)
-    if (bundle.version !== 'latest' && manifest.version !== bundle.version) {
-      throw new Error(`Bundle version mismatch: expected ${bundle.version}, got ${manifest.version}`);
-    }
-
-    this.logger.debug('Bundle manifest validation passed');
-
-    return manifest as DeploymentManifest;
-  }
-
-  /**
    * Get installation directory for bundle
    * Repository scope bundles are installed in the workspace's bundle storage
    * @param bundleId
@@ -434,30 +353,6 @@ export class BundleInstaller {
         throw new Error('Workspace storage not available');
       }
       return path.join(workspaceStorage, 'bundles', bundleId);
-    }
-  }
-
-  /**
-   * Copy bundle files to installation directory
-   * @param sourceDir
-   * @param targetDir
-   */
-  private async copyBundleFiles(sourceDir: string, targetDir: string): Promise<void> {
-    const files = await readdir(sourceDir);
-
-    for (const file of files) {
-      const sourcePath = path.join(sourceDir, file);
-      const targetPath = path.join(targetDir, file);
-
-      const stats = await stat(sourcePath);
-
-      if (stats.isDirectory()) {
-        await ensureDirectory(targetPath);
-        await this.copyBundleFiles(sourcePath, targetPath);
-      } else {
-        const content = await readFile(sourcePath);
-        await writeFile(targetPath, content);
-      }
     }
   }
 
@@ -527,19 +422,6 @@ export class BundleInstaller {
         const content = await readFile(sourcePath);
         await writeFile(targetPath, content);
       }
-    }
-  }
-
-  /**
-   * Clean up temporary directory
-   * @param tempDir
-   */
-  private async cleanupTempDir(tempDir: string): Promise<void> {
-    try {
-      await this.removeDirectory(tempDir);
-    } catch (error) {
-      this.logger.warn('Failed to cleanup temp directory', error);
-      // Don't fail the installation if cleanup fails
     }
   }
 
@@ -726,54 +608,126 @@ export class BundleInstaller {
   ): Promise<InstalledBundle> {
     this.logger.info(`Installing bundle from buffer: ${bundle.name} v${bundle.version}`);
 
-    try {
-      // Step 1: Create temp directory
-      const tempDir = await this.createTempDir();
-      this.logger.debug(`Created temp directory: ${tempDir}`);
+    // Check if this is a skills bundle (Anthropic-style skills source)
+    const isSkillsBundle = sourceType === 'skills' || sourceType === 'local-skills';
+    // For repository scope we must still run through the standard sync/lockfile flow; only
+    // user/workspace scopes should install directly into the Copilot skills directory.
+    const installSkillsToCopilotDir = isSkillsBundle && options.scope !== 'repository';
 
-      // Step 2: Write buffer to temp file
-      const bundleFile = path.join(tempDir, `${bundle.id}.zip`);
-      await writeFile(bundleFile, bundleBuffer);
-      this.logger.debug(`Wrote bundle buffer to: ${bundleFile} (${bundleBuffer.length} bytes)`);
+    // Bridge the extension's already-resolved Bundle + already-downloaded Buffer (the
+    // adapter did both before calling this method, per the "unified architecture" note
+    // at the top of this file) into InstallPipeline's resolve/download stages: both are
+    // no-ops here, there is nothing left to resolve or fetch over the network.
+    const spec: BundleSpec = {
+      sourceId: bundle.sourceId,
+      bundleId: bundle.id,
+      bundleVersion: bundle.version
+    };
+    const target: Target = {
+      name: 'vscode',
+      type: 'vscode',
+      scope: options.scope,
+      commitMode: options.commitMode
+    };
 
-      // Step 3: Extract bundle
-      const extractDir = path.join(tempDir, 'extracted');
-      await this.extractBundle(bundleFile, extractDir);
-      this.logger.debug(`Extracted bundle to: ${extractDir}`);
+    const resolver: BundleResolver = {
+      resolve: (): Promise<Installable> => Promise.resolve({
+        ref: {
+          sourceId: bundle.sourceId ?? 'unknown',
+          sourceType: sourceType ?? 'unknown',
+          bundleId: bundle.id,
+          bundleVersion: bundle.version,
+          installed: false
+        },
+        downloadUrl: '',
+        inlineBytes: bundleBuffer
+      })
+    };
 
-      // Step 4: Validate bundle structure
-      const manifest = await this.validateBundle(extractDir, bundle);
-      this.logger.debug('Bundle validation passed');
+    const downloader: BundleDownloader = {
+      download: (installable: Installable) => {
+        const bytes = installable.inlineBytes ?? new Uint8Array();
+        return Promise.resolve({
+          bytes,
+          sha256: createHash('sha256').update(bytes).digest('hex')
+        });
+      }
+    };
 
-      // Check if this is a skills bundle (Anthropic-style skills source)
-      const isSkillsBundle = sourceType === 'skills' || sourceType === 'local-skills';
-      // For repository scope we must still run through the standard sync/lockfile flow; only
-      // user/workspace scopes should install directly into the Copilot skills directory.
-      const installSkillsToCopilotDir = isSkillsBundle && options.scope !== 'repository';
-
-      let installDir: string;
-
-      if (installSkillsToCopilotDir) {
-        // Skills bundles install directly to Copilot skills directory for user/workspace scopes.
-        // Derive the skill's source directory from the manifest file path so skills packaged
-        // under a non-standard directory (e.g. .github/skills/) are resolved correctly.
-        const skillEntry = (manifest.prompts || []).find((p) => p.type === 'skill');
-        const skillFile = skillEntry?.file;
-        if (!skillFile) {
-          throw new Error('No skill entry found in bundle manifest');
+    const zipExtractor = new ZipBundleExtractor();
+    const extractor: BundleExtractor = {
+      extract: async (bytes: Uint8Array): Promise<ExtractedFiles> => {
+        const files = await zipExtractor.extract(bytes);
+        if (files.has('deployment-manifest.yml')) {
+          return files;
         }
-        const skillDir = path.dirname(skillFile);
-        const skillName = path.basename(skillDir);
-        const copilotScope = options.scope === 'workspace' ? 'workspace' : 'user';
-        installDir = this.copilotSync.getCopilotSkillsDirectory(copilotScope);
-        await ensureDirectory(installDir);
-        installDir = path.join(installDir, skillName);
 
-        this.logger.debug(`[BundleInstaller] Skills bundle detected, installing to: ${installDir}`);
+        // For local bundles (like awesome-copilot), deployment-manifest.yml is optional.
+        // Synthesize a minimal manifest from the bundle info so the pipeline's validate
+        // stage (core's validateManifest) still has an id/version/name to check.
+        this.logger.info(`No deployment-manifest.yml found for ${bundle.id}, creating minimal manifest`);
+        const fallbackManifest = {
+          id: bundle.id,
+          version: bundle.version,
+          name: bundle.name || bundle.id,
+          common: {
+            directories: [],
+            files: [],
+            include_patterns: ['**/*'],
+            exclude_patterns: []
+          },
+          bundle_settings: {
+            include_common_in_environment_bundles: true,
+            create_common_bundle: true,
+            compression: 'none',
+            naming: {
+              environment_bundle: bundle.id
+            }
+          },
+          metadata: {
+            manifest_version: '1.0',
+            description: bundle.description || bundle.name || bundle.id,
+            author: 'awesome-copilot',
+            last_updated: new Date().toISOString()
+          }
+        };
+        const augmented = new Map(files);
+        augmented.set('deployment-manifest.yml', new TextEncoder().encode(yaml.dump(fallbackManifest)));
+        return augmented;
+      }
+    };
 
-        // Copy skill files directly to ~/.copilot/skills/{skill-name}
-        const skillSourceDir = path.join(extractDir, skillDir);
-        if (fs.existsSync(skillSourceDir)) {
+    let installDir = '';
+
+    const writer: TargetWriter = {
+      write: async (_target: Target, files: ExtractedFiles): Promise<TargetWriteResult> => {
+        const written: string[] = [];
+
+        if (installSkillsToCopilotDir) {
+          // Skills bundles install directly to Copilot skills directory for user/workspace scopes.
+          // Find the skill directory by locating a SKILL.md entry in the bundle.
+          const skillEntry = [...files.keys()].find((p) => path.posix.basename(p).toLowerCase() === 'skill.md');
+          if (!skillEntry) {
+            throw new Error('Skills directory not found in bundle');
+          }
+
+          const skillDir = path.posix.dirname(skillEntry);
+          const skillName = getSkillName(skillEntry) ?? path.posix.basename(skillDir);
+
+          const copilotScope = options.scope === 'workspace' ? 'workspace' : 'user';
+          const skillsBaseDir = this.copilotSync.getCopilotSkillsDirectory(copilotScope);
+          await ensureDirectory(skillsBaseDir);
+          installDir = path.join(skillsBaseDir, skillName);
+
+          this.logger.debug(`[BundleInstaller] Skills bundle detected, installing to: ${installDir}`);
+
+          // Copy skill files directly to ~/.copilot/skills/{skill-name}
+          const skillEntryPrefix = `${skillDir}/`;
+          const skillEntries = [...files.entries()].filter(([p]) => p.startsWith(skillEntryPrefix));
+          if (skillEntries.length === 0) {
+            throw new Error(`Skill directory not found in bundle: ${skillDir}`);
+          }
+
           // Check for existing skill using checkPathExists to detect broken symlinks
           const existingEntry = await checkPathExists(installDir);
           if (existingEntry.exists) {
@@ -782,35 +736,56 @@ export class BundleInstaller {
               await fs.promises.unlink(installDir);
               this.logger.debug(`Removed broken symlink: ${installDir}`);
             } else {
-              const existingIsSymlink = existingEntry.isSymbolicLink;
-              const shouldOverwrite = await this.promptOverwriteSkill(skillName, installDir, existingIsSymlink);
+              const shouldOverwrite = await this.promptOverwriteSkill(skillName, installDir, existingEntry.isSymbolicLink);
               if (!shouldOverwrite) {
-                await this.cleanupTempDir(tempDir);
                 throw new Error(`Installation cancelled: skill '${skillName}' already exists`);
               }
               await this.removeDirectory(installDir);
             }
           }
-          await this.copyDirectory(skillSourceDir, installDir);
+
+          for (const [entryPath, bytes] of skillEntries) {
+            const outPath = path.join(installDir, entryPath.slice(skillEntryPrefix.length));
+            await ensureDirectory(path.dirname(outPath));
+            await writeFile(outPath, Buffer.from(bytes));
+            written.push(outPath);
+          }
         } else {
-          throw new Error(`Skill directory not found in bundle: ${skillDir}`);
+          // Standard bundles: copy all extracted files into the bundle cache directory.
+          installDir = this.getInstallDirectory(bundle.id, options.scope, bundle.name);
+          await ensureDirectory(installDir);
+          this.logger.debug(`Installation directory: ${installDir}`);
+
+          for (const [entryPath, bytes] of files) {
+            const outPath = path.join(installDir, entryPath);
+            await ensureDirectory(path.dirname(outPath));
+            await writeFile(outPath, Buffer.from(bytes));
+            written.push(outPath);
+          }
         }
-      } else {
-        // Step 5: Get installation directory (standard bundles)
-        installDir = this.getInstallDirectory(bundle.id, options.scope, bundle.name);
-        await ensureDirectory(installDir);
-        this.logger.debug(`Installation directory: ${installDir}`);
 
-        // Step 6: Copy files to installation directory
-        await this.copyBundleFiles(extractDir, installDir);
+        this.logger.debug('Files copied to installation directory');
+        return { written, skipped: [] };
+      },
+      remove: async (_target: Target, filePath: string): Promise<void> => {
+        if (installDir.length > 0) {
+          await unlink(path.join(installDir, filePath)).catch(() => undefined);
+        }
       }
-      this.logger.debug('Files copied to installation directory');
+    };
 
-      // Step 7: Clean up temp directory
-      await this.cleanupTempDir(tempDir);
-      this.logger.debug('Temp directory cleaned up');
+    const pipeline = new InstallPipeline({
+      resolver,
+      downloader,
+      extractor,
+      writerFactory: () => writer
+    });
 
-      // Step 8: Create installation record
+    try {
+      const outcome = await pipeline.run(spec, target);
+      const manifest = outcome.manifest as unknown as DeploymentManifest;
+
+      // Create installation record
       const installed: InstalledBundle = {
         bundleId: bundle.id,
         version: bundle.version,
@@ -852,6 +827,9 @@ export class BundleInstaller {
       return installed;
     } catch (error) {
       this.logger.error('Bundle installation from buffer failed', error as Error);
+      if (error instanceof InstallPipelineError) {
+        throw new Error(error.message.replace(/^(resolve|download|extract|validate|write) failed: /, ''));
+      }
       throw error;
     }
   }

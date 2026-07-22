@@ -14,6 +14,16 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import {
+  cleanupOrphanedSource,
+  readLockfile,
+  removeBundleEntry,
+  upsertBundleEntry,
+  upsertSource,
+} from '@ai-primitives-hub/app';
+import type {
+  LockfileFs,
+} from '@ai-primitives-hub/app';
 import * as vscode from 'vscode';
 import {
   Lockfile,
@@ -45,6 +55,34 @@ const LOCAL_LOCKFILE_NAME = 'prompt-registry.local.lock.json';
 const LOCKFILE_SCHEMA_VERSION = '2.0.0';
 const LOCKFILE_SCHEMA_URL = 'https://github.com/AmadeusITGroup/prompt-registry/schemas/lockfile.schema.json';
 const EXTENSION_ID = 'AmadeusITGroup.prompt-registry';
+
+/**
+ * Minimal Node fs adapter satisfying `@ai-primitives-hub/app`'s shared
+ * `LockfileFs` port. Only `readFile`/`exists` are exercised by
+ * `LockfileManager` today — writes still go through the existing
+ * temp-file + rename `writeAtomicToPath`, since the shared store's own
+ * `writeLockfile` helper does a plain write (plus a trailing newline)
+ * and does not provide that crash/corruption-safety guarantee.
+ */
+class NodeLockfileFs implements LockfileFs {
+  public readFile(p: string): Promise<string> {
+    return fs.promises.readFile(p, 'utf8');
+  }
+
+  public async exists(p: string): Promise<boolean> {
+    return fs.existsSync(p);
+  }
+
+  public writeFile(p: string, contents: string): Promise<void> {
+    return fs.promises.writeFile(p, contents, 'utf8');
+  }
+
+  public async remove(p: string): Promise<void> {
+    await fs.promises.unlink(p);
+  }
+}
+
+const lockfileFs = new NodeLockfileFs();
 
 /**
  * Options for creating or updating a bundle in the lockfile
@@ -201,11 +239,7 @@ export class LockfileManager {
   private async readLockfileByMode(commitMode: RepositoryCommitMode): Promise<Lockfile | null> {
     const lockfilePath = this.getLockfilePathForMode(commitMode);
     try {
-      if (!fs.existsSync(lockfilePath)) {
-        return null;
-      }
-      const content = await fs.promises.readFile(lockfilePath, 'utf8');
-      return JSON.parse(content) as Lockfile;
+      return await readLockfile(lockfilePath, lockfileFs);
     } catch (error) {
       this.logger.error(`Failed to read ${commitMode} lockfile:`, error instanceof Error ? error : undefined);
       return null;
@@ -258,14 +292,12 @@ export class LockfileManager {
     // Get the source ID before removing the bundle
     const sourceId = lockfile.bundles[bundleId].sourceId;
 
-    // Remove the bundle
-    delete lockfile.bundles[bundleId];
-
-    // Clean up orphaned sources (sources not referenced by any bundle)
-    this.cleanupOrphanedSources(lockfile, sourceId);
+    // Remove the bundle and clean up orphaned sources (sources not referenced by any bundle)
+    let updatedLockfile = removeBundleEntry(lockfile, bundleId);
+    updatedLockfile = cleanupOrphanedSource(updatedLockfile, sourceId);
 
     // If no bundles left, delete the lockfile
-    if (Object.keys(lockfile.bundles).length === 0) {
+    if (Object.keys(updatedLockfile.bundles).length === 0) {
       await this.deleteLockfileAtPath(lockfilePath);
 
       // If local lockfile was deleted, remove from git exclude
@@ -279,9 +311,9 @@ export class LockfileManager {
     }
 
     // Update timestamp and write
-    lockfile.generatedAt = new Date().toISOString();
-    await this.writeAtomicToPath(lockfile, lockfilePath);
-    this._onLockfileUpdated.fire(lockfile);
+    updatedLockfile.generatedAt = new Date().toISOString();
+    await this.writeAtomicToPath(updatedLockfile, lockfilePath);
+    this._onLockfileUpdated.fire(updatedLockfile);
   }
 
   /**
@@ -369,21 +401,6 @@ export class LockfileManager {
     } catch (error) {
       // Log but don't throw - git exclude is optional
       this.logger.warn('Failed to remove local lockfile from git exclude:', error instanceof Error ? error : undefined);
-    }
-  }
-
-  /**
-   * Clean up sources that are no longer referenced by any bundle
-   * @param lockfile
-   * @param removedSourceId
-   */
-  private cleanupOrphanedSources(lockfile: Lockfile, removedSourceId: string): void {
-    // Check if any other bundle references this source
-    const isSourceReferenced = Object.values(lockfile.bundles)
-      .some((bundle) => bundle.sourceId === removedSourceId);
-
-    if (!isSourceReferenced) {
-      delete lockfile.sources[removedSourceId];
     }
   }
 
@@ -600,11 +617,7 @@ export class LockfileManager {
    */
   public async read(): Promise<Lockfile | null> {
     try {
-      if (!fs.existsSync(this.lockfilePath)) {
-        return null;
-      }
-      const content = await fs.promises.readFile(this.lockfilePath, 'utf8');
-      return JSON.parse(content) as Lockfile;
+      return await readLockfile(this.lockfilePath, lockfileFs);
     } catch (error) {
       this.logger.error('Failed to read lockfile:', error instanceof Error ? error : undefined);
       return null;
@@ -731,32 +744,32 @@ export class LockfileManager {
       files,
       ...(checksum && { checksum })
     };
-    lockfile.bundles[bundleId] = bundleEntry;
+    let updatedLockfile = upsertBundleEntry(lockfile, bundleId, bundleEntry);
 
     // Update source entry
-    lockfile.sources[sourceId] = source;
+    updatedLockfile = upsertSource(updatedLockfile, sourceId, source);
 
     // Update hub entry if provided
     if (hub) {
-      if (!lockfile.hubs) {
-        lockfile.hubs = {};
+      if (!updatedLockfile.hubs) {
+        updatedLockfile.hubs = {};
       }
-      lockfile.hubs[hub.id] = hub.entry;
+      updatedLockfile.hubs[hub.id] = hub.entry;
     }
 
     // Update profile entry if provided
     if (profile) {
-      if (!lockfile.profiles) {
-        lockfile.profiles = {};
+      if (!updatedLockfile.profiles) {
+        updatedLockfile.profiles = {};
       }
-      lockfile.profiles[profile.id] = profile.entry;
+      updatedLockfile.profiles[profile.id] = profile.entry;
     }
 
     // Update timestamp
-    lockfile.generatedAt = new Date().toISOString();
+    updatedLockfile.generatedAt = new Date().toISOString();
 
     // Write atomically to the target lockfile
-    await this.writeAtomicToPath(lockfile, targetLockfilePath);
+    await this.writeAtomicToPath(updatedLockfile, targetLockfilePath);
 
     // If this is the first local-only bundle (local lockfile was just created),
     // add it to git exclude
@@ -765,7 +778,7 @@ export class LockfileManager {
       await this.ensureLocalLockfileExcluded();
     }
 
-    this._onLockfileUpdated.fire(lockfile);
+    this._onLockfileUpdated.fire(updatedLockfile);
   }
 
   /**
@@ -916,18 +929,18 @@ export class LockfileManager {
       files: bundleEntry.files,
       ...(bundleEntry.checksum && { checksum: bundleEntry.checksum })
     };
-    targetLockfile.bundles[bundleId] = cleanBundleEntry;
+    let updatedTargetLockfile = upsertBundleEntry(targetLockfile, bundleId, cleanBundleEntry);
 
     // Copy source entry to target lockfile if not already present
-    if (sourceEntry && !targetLockfile.sources[bundleEntry.sourceId]) {
-      targetLockfile.sources[bundleEntry.sourceId] = sourceEntry;
+    if (sourceEntry && !updatedTargetLockfile.sources[bundleEntry.sourceId]) {
+      updatedTargetLockfile = upsertSource(updatedTargetLockfile, bundleEntry.sourceId, sourceEntry);
     }
 
     // Update timestamp
-    targetLockfile.generatedAt = new Date().toISOString();
+    updatedTargetLockfile.generatedAt = new Date().toISOString();
 
     // Write target lockfile atomically
-    await this.writeAtomicToPath(targetLockfile, targetLockfilePath);
+    await this.writeAtomicToPath(updatedTargetLockfile, targetLockfilePath);
 
     // Handle git exclude for local lockfile
     // Requirement 4.4: Add to git exclude when moving to local-only
@@ -936,7 +949,7 @@ export class LockfileManager {
     }
 
     // Emit event with the target lockfile
-    this._onLockfileUpdated.fire(targetLockfile);
+    this._onLockfileUpdated.fire(updatedTargetLockfile);
   }
 
   /**
